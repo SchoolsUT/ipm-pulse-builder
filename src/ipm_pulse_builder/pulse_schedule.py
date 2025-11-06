@@ -142,13 +142,6 @@ class PulseProgram:
                       ) -> Tuple[List[float], List[float]]:
         """
         Sample the program's gate as a 0/1 signal at a fixed timestep.
-
-        Args:
-            dt_us: sample period in microseconds (> 0).
-            t_end_us: optional end time; defaults to the end of the last window.
-
-        Returns:
-            (t, y) where t[k] is time in µs and y[k] ∈ {0.0, 1.0}.
         """
         if dt_us <= 0:
             raise ValueError("dt_us must be > 0")
@@ -169,8 +162,9 @@ class PulseProgram:
         for k, tk in enumerate(t):
             while wi < len(windows) and tk > windows[wi][1]:
                 wi += 1
-            on = (wi < len(windows)) and (windows[wi][0] <= tk <= windows[wi][1])
-            y[k] = 1.0 if on else 0.0
+                # half-open: ON between edges only
+                on = (wi < len(windows)) and (windows[wi][0] < tk < windows[wi][1])
+                y[k] = 1.0 if on else 0.0
         return t, y
 
     def to_stairs(self) -> Tuple[List[float], List[float]]:
