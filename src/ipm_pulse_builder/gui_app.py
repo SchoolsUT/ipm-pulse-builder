@@ -1,539 +1,349 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-IPM Pulse Builder – GUI (Phase A)
----------------------------------
-Clean, uncluttered Tkinter GUI for constructing IPM input pulses and arranging
-them into a sequence. This GUI stays model-only (no hardware control here).
-
-Left:   Pulse Editor (one charging + PWM block → IPMInputPulse)
-Middle: Sequence List (ordered IPMInputPulse blocks with up/down/remove)
-Right:  Sequence options (spacing µs), preview (gate + placeholder current), save/load preset
-
-Run:
-  python3 gui_app.py
-"""
 from __future__ import annotations
-import json
-from typing import List, Tuple
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
+import csv, tempfile, os
 
-# Matplotlib embedding for previews
+import matplotlib
+matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
-# Import your model classes
-try:
-    from pulse_schedule import (
-        IPMInputPulse,
-        IPMPulseTrain,
-        PulseProgram,
-    )
-except Exception as e:  # helpful error if module not found
-    raise SystemExit("Could not import pulse_schedule.py. Ensure it is in the same folder.\n" + str(e))
+from pulse_schedule import Program, ChargePWM, Gap
+from export import export_sdg_csv
+from send_over_lan import send_program_over_lan, setup_iota_over_lan
 
-# Optional SDG exporter (USB CSV). GUI still runs if it's missing.
-try:
-    from export import export_sdg_csv
-    from export import program_to_binary_series
-except Exception:
-    export_sdg_csv = None
+def f3(x: float) -> str: return f"{x:.3f}"
 
-# -----------------------------
-# Small utilities
-# -----------------------------
-def f3(x: float) -> str:
-    return f"{x:.3f}"
-
-def parse_float(var: tk.StringVar, name: str) -> float:
-    try:
-        return float(var.get())
-    except ValueError:
-        raise ValueError(f"{name} must be a number")
-
-def pulse_to_dict(p: IPMInputPulse) -> dict:
-    return {
-        "charge_width_us": p.charge_width_us,
-        "pwm_width_us": p.pwm_width_us,
-        "pwm_period_us": p.pwm_period_us,
-        "pwm_count": p.pwm_count,
-    }
-
-def pulse_from_dict(d: dict) -> IPMInputPulse:
-    return IPMInputPulse(
-        charge_width_us=float(d.get("charge_width_us", 0.0)),
-        pwm_width_us=float(d.get("pwm_width_us", 0.0)),
-        pwm_period_us=float(d.get("pwm_period_us", 0.0)),
-        pwm_count=int(d.get("pwm_count", 0)),
-    )
-
-# -----------------------------
-# Pulse Editor (left panel)
-# -----------------------------
+# =========================
+# Left: Pulse Editor
+# =========================
 class PulseEditor(ttk.LabelFrame):
-    """Editor for a single IPMInputPulse (charge + PWM)."""
-    def __init__(self, master, on_add, on_update):
+    def __init__(self, master, on_add_pulse, on_add_gap, on_update_sel):
         super().__init__(master, text="Pulse Editor (Charging + PWM)")
-        self.on_add = on_add
-        self.on_update = on_update
+        self._on_add_pulse = on_add_pulse
+        self._on_add_gap = on_add_gap
+        self._on_update_sel = on_update_sel
 
-        self.charge_width_us = tk.StringVar(value="85.0")
-        self.pwm_width_us    = tk.StringVar(value="6.7")
-        self.pwm_period_us   = tk.StringVar(value="20.0")
-        self.pwm_count       = tk.StringVar(value="10")
+        self.v_charge = tk.StringVar(value="85.0")
+        self.v_pwmw  = tk.StringVar(value="6.7")
+        self.v_pwmp  = tk.StringVar(value="20.0")
+        self.v_pwmn  = tk.StringVar(value="10")
+        self.v_gap   = tk.StringVar(value="100.0")
 
-        grid = ttk.Frame(self)
-        grid.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        g = ttk.Frame(self); g.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
+        rows = [
+            ("Charge width (µs)", self.v_charge),
+            ("PWM width (µs)",   self.v_pwmw),
+            ("PWM period (µs)",  self.v_pwmp),
+            ("PWM count",        self.v_pwmn),
+        ]
+        for r, (label, var) in enumerate(rows):
+            ttk.Label(g, text=label).grid(row=r, column=0, sticky="w")
+            ttk.Entry(g, textvariable=var, width=12).grid(row=r, column=1, sticky="ew")
+        ttk.Button(g, text="Add to Sequence", command=self._add_pulse).grid(row=4, column=0, sticky="ew", pady=(8,0))
+        ttk.Button(g, text="Update Selected", command=self._update_sel).grid(row=4, column=1, sticky="ew", pady=(8,0))
 
-        r = 0
-        ttk.Label(grid, text="Charge width (µs)").grid(row=r, column=0, sticky="w")
-        ttk.Entry(grid, textvariable=self.charge_width_us, width=12).grid(row=r, column=1, sticky="ew"); r += 1
-        ttk.Label(grid, text="PWM width (µs)").grid(row=r, column=0, sticky="w")
-        ttk.Entry(grid, textvariable=self.pwm_width_us, width=12).grid(row=r, column=1, sticky="ew"); r += 1
-        ttk.Label(grid, text="PWM period (µs)").grid(row=r, column=0, sticky="w")
-        ttk.Entry(grid, textvariable=self.pwm_period_us, width=12).grid(row=r, column=1, sticky="ew"); r += 1
-        ttk.Label(grid, text="PWM count").grid(row=r, column=0, sticky="w")
-        ttk.Entry(grid, textvariable=self.pwm_count, width=12).grid(row=r, column=1, sticky="ew"); r += 1
+        # GAP
+        ttk.Label(g, text="Insert GAP (µs)").grid(row=5, column=0, sticky="w", pady=(12,0))
+        ttk.Entry(g, textvariable=self.v_gap, width=12).grid(row=5, column=1, sticky="ew", pady=(12,0))
+        ttk.Button(g, text="Insert Gap", command=self._add_gap).grid(row=6, column=0, columnspan=2, sticky="ew")
 
-        btns = ttk.Frame(grid)
-        btns.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(8,0))
-        ttk.Button(btns, text="Add to Sequence", command=self._handle_add).pack(side=tk.LEFT)
-        ttk.Button(btns, text="Update Selected", command=self._handle_update).pack(side=tk.LEFT, padx=6)
+        g.columnconfigure(1, weight=1)
 
-        for c in (0,1):
-            grid.columnconfigure(c, weight=1)
-
-    def get_pulse(self) -> IPMInputPulse:
-        cw = parse_float(self.charge_width_us, "Charge width")
-        pw = parse_float(self.pwm_width_us, "PWM width")
-        pp = parse_float(self.pwm_period_us, "PWM period")
-        pc = int(parse_float(self.pwm_count, "PWM count"))
-        if pw <= 0 or pp <= 0 or cw <= 0:
-            raise ValueError("Widths and period must be > 0")
-        if pw > pp:
-            raise ValueError("PWM width must be ≤ period")
-        if pc < 1:
-            raise ValueError("PWM count must be ≥ 1")
-        return IPMInputPulse(cw, pw, pp, pc)
-
-    def set_pulse(self, p: IPMInputPulse):
-        self.charge_width_us.set(f3(p.charge_width_us))
-        self.pwm_width_us.set(f3(p.pwm_width_us))
-        self.pwm_period_us.set(f3(p.pwm_period_us))
-        self.pwm_count.set(str(p.pwm_count))
-
-    def _handle_add(self):
-        try:
-            self.on_add(self.get_pulse())
-        except Exception as e:
-            messagebox.showerror("Add Pulse", str(e))
-
-    def _handle_update(self):
-        try:
-            self.on_update(self.get_pulse())
-        except Exception as e:
-            messagebox.showerror("Update Pulse", str(e))
-
-# -----------------------------
-# Sequence List (middle panel)
-# -----------------------------
-class SequenceList(ttk.LabelFrame):
-    """Shows an ordered list of IPMInputPulse blocks with simple controls."""
-    def __init__(self, master, on_select_change):
-        super().__init__(master, text="Sequence")
-        self.on_select_change = on_select_change
-        self.items: List[IPMInputPulse] = []
-
-        frame = ttk.Frame(self); frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        self.listbox = tk.Listbox(frame, height=16)
-        self.listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.listbox.bind("<<ListboxSelect>>", self._on_select)
-
-        btns = ttk.Frame(frame); btns.pack(side=tk.LEFT, fill=tk.Y, padx=(8,0))
-        ttk.Button(btns, text="↑", width=4, command=self.move_up).pack(pady=2)
-        ttk.Button(btns, text="↓", width=4, command=self.move_down).pack(pady=2)
-        ttk.Button(btns, text="Remove", command=self.remove).pack(pady=(8,2))
-        ttk.Button(btns, text="Clear", command=self.clear).pack()
-
-    def _on_select(self, _evt=None):
-        idx = self.selected_index()
-        if idx is not None:
-            self.on_select_change(self.items[idx])
-
-    def selected_index(self):
-        sel = self.listbox.curselection()
-        return sel[0] if sel else None
-
-    def append(self, p: IPMInputPulse):
-        self.items.append(p)
-        self.listbox.insert(tk.END, self._label(p))
-
-    def update_selected(self, p: IPMInputPulse):
-        idx = self.selected_index()
-        if idx is None:
-            raise ValueError("Select an item to update")
-        self.items[idx] = p
-        self.listbox.delete(idx)
-        self.listbox.insert(idx, self._label(p))
-        self.listbox.selection_set(idx)
-
-    def move_up(self):
-        idx = self.selected_index()
-        if idx is None or idx == 0:
-            return
-        self.items[idx-1], self.items[idx] = self.items[idx], self.items[idx-1]
-        txt = self.listbox.get(idx)
-        self.listbox.delete(idx)
-        self.listbox.insert(idx-1, txt)
-        self.listbox.selection_set(idx-1)
-
-    def move_down(self):
-        idx = self.selected_index()
-        if idx is None or idx == len(self.items)-1:
-            return
-        self.items[idx+1], self.items[idx] = self.items[idx], self.items[idx+1]
-        txt = self.listbox.get(idx)
-        self.listbox.delete(idx)
-        self.listbox.insert(idx+1, txt)
-        self.listbox.selection_set(idx+1)
-
-    def remove(self):
-        idx = self.selected_index()
-        if idx is None:
-            return
-        self.items.pop(idx)
-        self.listbox.delete(idx)
-
-    def clear(self):
-        self.items.clear()
-        self.listbox.delete(0, tk.END)
-
-    @staticmethod
-    def _label(p: IPMInputPulse) -> str:
-        return (
-            f"Charge {f3(p.charge_width_us)} µs | "
-            f"PWM {f3(p.pwm_width_us)}/{f3(p.pwm_period_us)} µs x{p.pwm_count}"
+    def _read_pulse(self) -> ChargePWM:
+        return ChargePWM(
+            charge_width_us=float(self.v_charge.get()),
+            pwm_width_us=float(self.v_pwmw.get()),
+            pwm_period_us=float(self.v_pwmp.get()),
+            pwm_count=int(self.v_pwmn.get())
         )
 
-# -----------------------------
-# Preview Panel (bottom)
-# -----------------------------
-class PreviewPanel(ttk.LabelFrame):
+    def set_fields_from_pulse(self, p: ChargePWM) -> None:
+        self.v_charge.set(f3(p.charge_width_us))
+        self.v_pwmw.set(f3(p.pwm_width_us))
+        self.v_pwmp.set(f3(p.pwm_period_us))
+        self.v_pwmn.set(str(p.pwm_count))
+
+    def _add_pulse(self):
+        try:
+            self._on_add_pulse(self._read_pulse())
+        except Exception as e:
+            messagebox.showerror("Pulse", str(e))
+
+    def _update_sel(self):
+        try:
+            self._on_update_sel(self._read_pulse())
+        except Exception as e:
+            messagebox.showerror("Update", str(e))
+
+    def _add_gap(self):
+        try:
+            g = Gap(gap_us=float(self.v_gap.get()))
+            self._on_add_gap(g)
+        except Exception as e:
+            messagebox.showerror("Gap", str(e))
+
+# =========================
+# Middle: Sequence list
+# =========================
+class SequenceList(ttk.LabelFrame):
+    def __init__(self, master, on_select):
+        super().__init__(master, text="Sequence")
+        self.on_select = on_select
+        self.items: list[ChargePWM | Gap] = []
+
+        frm = ttk.Frame(self); frm.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
+        self.lb = tk.Listbox(frm, width=44, height=16)
+        self.lb.grid(row=0, column=0, rowspan=6, sticky="nsew")
+        sb = ttk.Scrollbar(frm, orient="vertical", command=self.lb.yview)
+        self.lb.config(yscrollcommand=sb.set); sb.grid(row=0, column=1, rowspan=6, sticky="ns")
+        ttk.Button(frm, text="↑", command=self.up).grid(row=0, column=2, sticky="ew")
+        ttk.Button(frm, text="↓", command=self.down).grid(row=1, column=2, sticky="ew")
+        ttk.Button(frm, text="Remove", command=self.remove).grid(row=2, column=2, sticky="ew")
+        ttk.Button(frm, text="Clear", command=self.clear).grid(row=3, column=2, sticky="ew")
+
+        frm.rowconfigure(5, weight=1); frm.columnconfigure(0, weight=1)
+        self.lb.bind("<<ListboxSelect>>", self._sel)
+
+    def _label(self, it: ChargePWM | Gap) -> str:
+        if isinstance(it, Gap):
+            return f"GAP {f3(it.gap_us)} µs"
+        return f"Pulse  Charge {f3(it.charge_width_us)} µs | PWM {f3(it.pwm_width_us)}/{f3(it.pwm_period_us)} µs ×{it.pwm_count}"
+
+    def add(self, it: ChargePWM | Gap) -> None:
+        self.items.append(it); self.lb.insert(tk.END, self._label(it))
+
+    def update_selected(self, p: ChargePWM) -> None:
+        sel = self.lb.curselection()
+        if not sel: return
+        i = sel[0]
+        if isinstance(self.items[i], Gap):
+            messagebox.showwarning("Update", "Selected item is a GAP. Remove and re-insert to change.")
+            return
+        self.items[i] = p
+        self.lb.delete(i); self.lb.insert(i, self._label(p)); self.lb.select_set(i)
+
+    def remove(self):
+        sel = self.lb.curselection()
+        if not sel: return
+        i = sel[0]
+        self.lb.delete(i); self.items.pop(i)
+
+    def clear(self):
+        self.lb.delete(0, tk.END); self.items.clear()
+
+    def up(self):
+        sel = self.lb.curselection()
+        if not sel or sel[0] == 0: return
+        i = sel[0]
+        self.items[i-1], self.items[i] = self.items[i], self.items[i-1]
+        txt = self.lb.get(i); self.lb.delete(i); self.lb.insert(i-1, txt); self.lb.select_set(i-1)
+
+    def down(self):
+        sel = self.lb.curselection()
+        if not sel or sel[0] == len(self.items)-1: return
+        i = sel[0]
+        self.items[i+1], self.items[i] = self.items[i], self.items[i+1]
+        txt = self.lb.get(i); self.lb.delete(i); self.lb.insert(i+1, txt); self.lb.select_set(i+1)
+
+    def _sel(self, _):
+        sel = self.lb.curselection()
+        if not sel: return
+        it = self.items[sel[0]]
+        if isinstance(it, ChargePWM):
+            self.on_select(it)
+
+# =========================
+# Right: Options / IOTA
+# =========================
+class OptionsPane(ttk.LabelFrame):
+    def __init__(self, master, on_preview, on_export, on_send,
+                 on_iota_send, on_iota_to_ipm):
+        super().__init__(master, text="Options / Preview / Send (CH1 = IPM)")
+        self.on_preview, self.on_export, self.on_send = on_preview, on_export, on_send
+        self.on_iota_send, self.on_iota_to_ipm = on_iota_send, on_iota_to_ipm
+
+        self.spacing = tk.StringVar(value="0.0")
+        self.gas_us  = tk.StringVar(value="500.0")
+        self.delay_ms= tk.StringVar(value="0.0")
+
+        g = ttk.Frame(self); g.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
+        ttk.Label(g, text="Spacing between all blocks (µs)").grid(row=0, column=0, sticky="w")
+        ttk.Entry(g, textvariable=self.spacing, width=10).grid(row=0, column=1, sticky="ew")
+
+        ttk.Button(g, text="Preview", command=self._preview).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8,0))
+        ttk.Button(g, text="Export CSV (USB)", command=self._export).grid(row=2, column=0, columnspan=2, sticky="ew")
+        ttk.Button(g, text="Send to SDG (LAN)", command=self._send).grid(row=3, column=0, columnspan=2, sticky="ew")
+
+        sep = ttk.Separator(g, orient="horizontal"); sep.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(10,6))
+        ttk.Label(g, text="IOTA (CH2)").grid(row=5, column=0, columnspan=2)
+
+        ttk.Label(g, text="Gas Injection Duration (µs)").grid(row=6, column=0, sticky="w")
+        ttk.Entry(g, textvariable=self.gas_us, width=10).grid(row=6, column=1, sticky="ew")
+        ttk.Label(g, text="Delay to IPM (ms)").grid(row=7, column=0, sticky="w")
+        ttk.Entry(g, textvariable=self.delay_ms, width=10).grid(row=7, column=1, sticky="ew")
+
+        ttk.Button(g, text="Send IOTA (CH2)", command=self._iota_send).grid(row=8, column=0, columnspan=2, sticky="ew", pady=(6,0))
+        ttk.Button(g, text="IOTA → IPM (coarse via LAN)", command=self._iota_to_ipm).grid(row=9, column=0, columnspan=2, sticky="ew")
+
+        g.columnconfigure(1, weight=1)
+
+    def _spacing(self) -> float:
+        try: return float(self.spacing.get() or 0.0)
+        except: return 0.0
+
+    def _preview(self): self.on_preview(self._spacing())
+    def _export(self):  self.on_export(self._spacing())
+    def _send(self):    self.on_send(self._spacing())
+
+    def _iota_send(self):
+        try:
+            gas = float(self.gas_us.get())
+            dms = float(self.delay_ms.get())
+            self.on_iota_send(gas, dms)
+        except Exception as e:
+            messagebox.showerror("IOTA", str(e))
+
+    def _iota_to_ipm(self):
+        try:
+            gas = float(self.gas_us.get())
+            dms = float(self.delay_ms.get())
+            self.on_iota_to_ipm(gas, dms)
+        except Exception as e:
+            messagebox.showerror("IOTA", str(e))
+
+# =========================
+# Preview panel
+# =========================
+class PlotPane(ttk.LabelFrame):
     def __init__(self, master):
         super().__init__(master, text="Preview")
-        self.fig = Figure(figsize=(8, 3.6), dpi=100)
+        self.fig = Figure(figsize=(8,3.3), layout="constrained")
         self.ax1 = self.fig.add_subplot(211)
-        self.ax2 = self.fig.add_subplot(212, sharex=self.ax1)  # <-- share x
-        self.ax1.tick_params(labelbottom=False)
-        self.ax1.set_ylabel("IPM Input (±1)")
-        self.ax2.set_ylabel("Predicted Discharge Current (A)")
-        self.ax2.set_xlabel("Time (µs)")
+        self.ax2 = self.fig.add_subplot(212, sharex=self.ax1)
         self.canvas = FigureCanvasTkAgg(self.fig, master=self)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-    def update_plots(self, gate: Tuple[list, list], current: Tuple[list, list]):
-        tg, yg = gate
-        tc, ic = current
+    def show_from_csv(self, program: Program, npoints: int = 4096):
+        # generate the SAME data we export
+        t_us, y = program.sample(npoints)
         self.ax1.clear(); self.ax2.clear()
-
-        # Gate in ±1 so it matches SDG export convention
-        yg_pm = [1.0 if v >= 0.5 else -1.0 for v in yg]
-        yg_pm = [max(-1.0, min(1.0, vv)) for vv in yg_pm]  
-        self.ax1.step(tg, yg_pm, where='post')
+        self.ax1.plot(t_us, y)
         self.ax1.set_ylabel("IPM Input (±1)")
-        self.ax1.set_yticks([-1.0, 0.0, 1.0])
-        self.ax1.set_ylim(-1.05, 1.05)   # no “below −1” look
-        self.ax1.margins(x=0, y=0)
-        self.ax1.grid(True, alpha=0.3)
+        self.ax1.set_ylim(-1.1, 1.1)
 
-        self.ax2.plot(tc, ic)
+        # simple rise/decay placeholder current
+        import math
+        T = max(program.duration_us(), 1e-9)
+        dt = T / (len(t_us) - 1)
+        I, cur = [], 0.0
+        tau_on = 50.0; tau_off = 100.0; Imax = 85.0
+        # reconstruct HIGH windows from samples
+        for v in y:
+            if v > 0:
+                cur += (Imax - cur) * (1 - math.exp(-dt/tau_on))
+            else:
+                cur -= cur * (1 - math.exp(-dt/tau_off))
+            I.append(max(0.0, cur))
+        self.ax2.plot(t_us, I)
         self.ax2.set_ylabel("Predicted Discharge Current (A)")
         self.ax2.set_xlabel("Time (µs)")
-        self.ax2.grid(True, alpha=0.3)
-
-        xmax = max(tg[-1] if tg else 0.0, tc[-1] if tc else 0.0)
-        self.ax1.set_xlim(0.0, xmax)
-        self.ax1.margins(x=0)    # no extra padding
-        self.ax2.margins(x=0)
-        self.fig.tight_layout()
         self.canvas.draw_idle()
 
-# -----------------------------
-# Sequence Options (right panel)
-# -----------------------------
-class SequenceOptions(ttk.LabelFrame):
-    def __init__(self, master, get_items, on_preview):
-        super().__init__(master, text="Sequence Options, Preview & Summary")
-        self.get_items = get_items
-        self.on_preview = on_preview
-
-        self.spacing_us = tk.StringVar(value="0.0")
-        self.summary = tk.StringVar(value="Total: 0 pulses, 0.00 µs")
-
-        # Placeholder current model params
-        self.model_enable = tk.BooleanVar(value=True)
-        self.tau_on_us = tk.StringVar(value="50.0")
-        self.tau_off_us = tk.StringVar(value="100.0")
-        self.imax_a = tk.StringVar(value="100.0")
-
-        grid = ttk.Frame(self); grid.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-
-        r = 0
-        ttk.Label(grid, text="Spacing between blocks (µs)").grid(row=r, column=0, sticky="w")
-        ttk.Entry(grid, textvariable=self.spacing_us, width=10).grid(row=r, column=1, sticky="ew"); r += 1
-
-        ttk.Separator(grid, orient=tk.HORIZONTAL).grid(row=r, column=0, columnspan=2, sticky="ew", pady=6); r += 1
-
-        ttk.Checkbutton(grid, text="Predict current (placeholder)", variable=self.model_enable).grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
-        ttk.Label(grid, text="τ_on (µs)").grid(row=r, column=0, sticky="w")
-        ttk.Entry(grid, textvariable=self.tau_on_us, width=10).grid(row=r, column=1, sticky="ew"); r += 1
-        ttk.Label(grid, text="τ_off (µs)").grid(row=r, column=0, sticky="w")
-        ttk.Entry(grid, textvariable=self.tau_off_us, width=10).grid(row=r, column=1, sticky="ew"); r += 1
-        ttk.Label(grid, text="I_max (A)").grid(row=r, column=0, sticky="w")
-        ttk.Entry(grid, textvariable=self.imax_a, width=10).grid(row=r, column=1, sticky="ew"); r += 1
-
-        ttk.Button(grid, text="Build Summary", command=self.recalc).grid(row=r, column=0, columnspan=2, sticky="ew", pady=(8,0)); r += 1
-        ttk.Button(grid, text="Preview", command=self.preview).grid(row=r, column=0, columnspan=2, sticky="ew"); r += 1
-        ttk.Label(grid, textvariable=self.summary, foreground="#333").grid(row=r, column=0, columnspan=2, sticky="w", pady=(6,0)); r += 1
-
-        # Save/Load preset
-        ttk.Button(grid, text="Save Preset", command=self.save_preset).grid(row=r, column=0, sticky="ew", pady=(12,0))
-        ttk.Button(grid, text="Load Preset", command=self.load_preset).grid(row=r, column=1, sticky="ew", pady=(12,0))
-
-        for c in (0,1):
-            grid.columnconfigure(c, weight=1)
-
-    def recalc(self):
-        try:
-            spacing = float(self.spacing_us.get())
-        except ValueError:
-            messagebox.showerror("Spacing", "Spacing must be a number"); return
-        items = self.get_items()
-        train = IPMPulseTrain(spacing_us=spacing)
-        for p in items: train.add(p)
-        program: PulseProgram = train.to_program()
-        stats = program.stats()
-        self.summary.set(
-            f"Blocks: {len(items)} | Total duration: {f3(stats['total_duration_us'])} µs | "
-            f"Avg duty: {stats['avg_duty']:.3f}"
-        )
-
-    def preview(self):
-        try:
-            params = {
-                'spacing_us': float(self.spacing_us.get() or 0.0),
-                'model_enable': bool(self.model_enable.get()),
-                'tau_on_us': float(self.tau_on_us.get() or 0.0),
-                'tau_off_us': float(self.tau_off_us.get() or 0.0),
-                'imax_a': float(self.imax_a.get() or 0.0),
-            }
-        except ValueError:
-            messagebox.showerror("Preview", "Preview parameters must be numbers"); return
-        self.on_preview(params)
-
-    def save_preset(self):
-        items = self.get_items()
-        data = {"spacing_us": float(self.spacing_us.get() or 0.0),
-                "blocks": [pulse_to_dict(p) for p in items]}
-        path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[["JSON","*.json"]])
-        if not path: return
-        with open(path, "w") as f: json.dump(data, f, indent=2)
-        messagebox.showinfo("Save", f"Saved preset → {path}")
-
-    def load_preset(self):
-        path = filedialog.askopenfilename(filetypes=[["JSON","*.json"],["All","*.*"]])
-        if not path: return
-        with open(path, "r") as f: data = json.load(f)
-        try:
-            self.spacing_us.set(str(float(data.get("spacing_us", 0.0))))
-            blocks = [pulse_from_dict(d) for d in data.get("blocks", [])]
-        except Exception as e:
-            messagebox.showerror("Load", f"Invalid preset: {e}"); return
-        self.event_generate("<<PresetLoaded>>", when="tail")
-        self._loaded_blocks = blocks  # consumed by MainApp.on_preset_loaded
-
-# -----------------------------
-# Main App
-# -----------------------------
+# =========================
+# Main app wiring
+# =========================
 class MainApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("IPM Pulse Builder")
-        self.geometry("1200x720")
+        self.title("IPM Pulse Builder"); self.geometry("1200x760")
 
-        # Top-level container
         root = ttk.Frame(self); root.pack(fill=tk.BOTH, expand=True)
-
-        # Left: editor
-        self.editor = PulseEditor(root, on_add=self.on_add_pulse, on_update=self.on_update_pulse)
+        self.editor = PulseEditor(root, self._add_pulse, self._add_gap, self._update_sel)
         self.editor.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
 
-        # Middle: sequence list
-        self.sequence = SequenceList(root, on_select_change=self.editor.set_pulse)
-        self.sequence.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self.seq = SequenceList(root, self._on_select)
+        self.seq.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
 
-        # Right: options + preview controls
-        self.options = SequenceOptions(root, get_items=lambda: self.sequence.items, on_preview=self.on_preview)
-        self.options.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
-        self.options.bind("<<PresetLoaded>>", self.on_preset_loaded)
-
-        # Bottom: live preview (two stacked plots)
-        self.preview = PreviewPanel(self)
-        self.preview.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0,8))
-
-        self._build_menu()
-
-    def _build_menu(self):
-        menubar = tk.Menu(self)
-
-        # File → Export
-        filem = tk.Menu(menubar, tearoff=0)
-        exportm = tk.Menu(filem, tearoff=0)
-        exportm.add_command(label="SDG CSV (USB)…", command=self.menu_export_sdg_csv)
-        filem.add_cascade(label="Export", menu=exportm)
-        menubar.add_cascade(label="File", menu=filem)
-
-        # Help
-        helpm = tk.Menu(menubar, tearoff=0)
-        helpm.add_command(label="About", command=lambda: messagebox.showinfo(
-            "About",
-            "IPM Pulse Builder – clean editor for charging+PWM blocks.\n"
-            "Save/Load presets; sequence builder + preview only."
-        ))
-        menubar.add_cascade(label="Help", menu=helpm)
-
-        self.config(menu=menubar)
-
-    # --- callbacks ---
-    def on_add_pulse(self, p: IPMInputPulse):
-        self.sequence.append(p); self.options.recalc()
-
-    def on_update_pulse(self, p: IPMInputPulse):
-        self.sequence.update_selected(p); self.options.recalc()
-
-    def on_preset_loaded(self, _evt=None):
-        blocks = getattr(self.options, "_loaded_blocks", None)
-        if blocks is None: return
-        self.sequence.clear()
-        for p in blocks: self.sequence.append(p)
-        self.options.recalc()
-        self.options._loaded_blocks = None
-
-    # --- preview orchestration ---
-    def on_preview(self, params: dict):
-        """Build program from current list + spacing, then draw gate & current."""
-        try:
-            items = self.sequence.items
-            if not items:
-                messagebox.showinfo("Preview", "Add at least one IPM pulse to the sequence first.")
-                return
-
-            train = IPMPulseTrain(spacing_us=float(params.get('spacing_us', 0.0)))
-            for p in items: train.add(p)
-            program = train.to_program()    
-
-            # Use the exporter’s fixed-length series (the same logic used for CSV)
-            t_gate, y_on = program_to_binary_series(program, points=4000)
-            y_gate_pm = [2*v - 1.0 for v in y_on]   # 0→-1, 1→+1
-
-            # Placeholder current model (half-open windows)
-            dt = self._auto_dt(program)  # for model only
-            if params.get('model_enable', True):
-                t_cur, i_cur = self._predict_current_from_windows(
-                    program.schedule(),
-                    dt_us=dt,
-                    tau_on_us=float(params.get('tau_on_us', 50.0)),
-                    tau_off_us=float(params.get('tau_off_us', 100.0)),
-                    imax=float(params.get('imax_a', 100.0))
-                )
-            else:
-                t_cur, i_cur = t_gate, [0.0]*len(t_gate)
-
-            self.preview.update_plots((t_gate, y_gate_pm), (t_cur, i_cur))
-        except Exception as e:
-            messagebox.showerror("Preview error", str(e))
-
-    @staticmethod
-    def _auto_dt(program: PulseProgram) -> float:
-        windows = program.schedule()
-        if not windows: return 1.0
-        min_width = min((e - s) for s, e in windows)
-        return max(0.05, min_width / 20.0)
-
-    @staticmethod
-    def _predict_current_from_windows(windows: List[Tuple[float, float]], dt_us: float,
-                                      tau_on_us: float, tau_off_us: float, imax: float) -> Tuple[list, list]:
-        """First-order rise/decay placeholder using half-open windows [start, end)."""
-        if not windows:
-            return [0.0], [0.0]
-        T = windows[-1][1]
-        n = int(max(1, round(T / dt_us)))
-        t = [i * dt_us for i in range(n + 1)]
-        i = [0.0]*(n+1)
-
-        wi = 0
-        for k, tk in enumerate(t[1:], start=1):
-            while wi < len(windows) and tk > windows[wi][1]:
-                wi += 1
-            on = (wi < len(windows)) and (windows[wi][0] < tk < windows[wi][1])
-            di = (imax - i[k-1]) * (dt_us / tau_on_us) if on else (-i[k-1] * (dt_us / tau_off_us))
-            i[k] = max(0.0, i[k-1] + di)
-
-        i[0] = 0.0; i[-1] = 0.0
-        return t, i
-
-    # --- export ---
-    def menu_export_sdg_csv(self):
-        if export_sdg_csv is None:
-            messagebox.showerror("Export", "sdg_export.py not found. Place it next to gui_app.py.")
-            return
-        items = self.sequence.items
-        if not items:
-            messagebox.showinfo("Export", "Add at least one IPM pulse to the sequence first.")
-            return
-
-        try:
-            spacing = float(self.options.spacing_us.get() or 0.0)
-        except ValueError:
-            messagebox.showerror("Export", "Spacing must be a number."); return
-
-        train = IPMPulseTrain(spacing_us=spacing)
-        for p in items: train.add(p)
-        program: PulseProgram = train.to_program()
-
-        path = filedialog.asksaveasfilename(
-            title="Save SDG CSV",
-            defaultextension=".csv",
-            filetypes=[("CSV", "*.csv")],
-            initialfile="ipm_charge_pwm.csv"
+        self.opts = OptionsPane(
+            root, self.on_preview, self.on_export, self.on_send,
+            self.on_iota_send, self.on_iota_to_ipm
         )
-        if not path:
-            return
+        self.opts.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
 
+        self.plot = PlotPane(self); self.plot.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0,8))
+
+    def _on_select(self, p: ChargePWM): self.editor.set_fields_from_pulse(p)
+
+    def _add_pulse(self, p: ChargePWM): self.seq.add(p)
+    def _add_gap(self, g: Gap): self.seq.add(g)
+
+    def _update_sel(self, p: ChargePWM): self.seq.update_selected(p)
+
+    # ---- program assembly ----
+    def _build_program(self, spacing_us: float) -> Program:
+        prog = Program()
+        # spacing_us is an extra GAP between items
+        first = True
+        for it in self.seq.items:
+            if not first and spacing_us > 0:
+                prog.add(Gap(spacing_us))
+            prog.add(it)
+            first = False
+        return prog
+
+    # ---- UI handlers ----
+    def on_preview(self, spacing_us: float):
+        prog = self._build_program(spacing_us)
+        self.plot.show_from_csv(prog)
+
+    def on_export(self, spacing_us: float):
+        if not self.seq.items:
+            messagebox.showwarning("Export", "Sequence is empty."); return
+        path = filedialog.asksaveasfilename(title="Save Siglent CSV",
+                                            defaultextension=".csv",
+                                            filetypes=[("CSV","*.csv")],
+                                            initialfile="IPM_GATE.csv")
+        if not path: return
+        prog = self._build_program(spacing_us)
+        arb_f = export_sdg_csv(prog, path, npoints=4096)
+        messagebox.showinfo("Exported",
+            f"Saved: {os.path.basename(path)}\n"
+            f"Total duration: {prog.duration_us():.3f} µs\n"
+            f"Suggested ARB frequency: {arb_f:.2f} Hz\n\n"
+            "On the SDG:\n• Store/Recall → File Type: Data → select CSV on USB\n"
+            "• Set ARB Frequency to the value above\n• Set High=5 V, Low=0 V, Load=Hi-Z")
+
+    def on_send(self, spacing_us: float):
+        if not self.seq.items:
+            messagebox.showwarning("Send", "Sequence is empty."); return
+        prog = self._build_program(spacing_us)
         try:
-            meta = export_sdg_csv(program, path, points=16000)  # exports ±1
+            arb_f = send_program_over_lan(prog)  # CH1 only sets freq/levels
         except Exception as e:
-            messagebox.showerror("Export", f"Failed to export CSV:\n{e}"); return
+            messagebox.showerror("Send to SDG (LAN)", f"Failed: {e}")
+            return
+        messagebox.showinfo("Sent",
+            f"LAN setup complete for CH1\n"
+            f"Total duration: {prog.duration_us():.3f} µs\n"
+            f"ARB frequency set to {arb_f:.2f} Hz\n"
+            "Levels: High 5.0 V / Low 0.0 V / Load Hi-Z\n\n"
+            "REMINDER: select your CSV on the SDG from USB first.")
 
-        freq = meta.get("suggested_frequency_hz", 0.0)
-        dur_us = meta.get("total_duration_us", 0.0)
-        messagebox.showinfo(
-            "Export complete",
-            (
-                f"Saved:\n{path}\n\n"
-                f"Total duration: {dur_us:.3f} µs\n"
-                f"Suggested ARB frequency: {freq:.6g} Hz\n\n"
-                "On the SDG:\n"
-                "  • Store/Recall → File Type: Data → select the CSV on USB\n"
-                "  • Set ARB Frequency to the value above (scales time)\n"
-                "  • Set High/Low to 5 V / 0 V and Load to match your IPM input\n"
-            )
-        )
+    # IOTA (CH2)
+    def on_iota_send(self, gas_us: float, delay_ms: float):
+        try:
+            setup_iota_over_lan(gas_us=gas_us, delay_ms=delay_ms)
+        except Exception as e:
+            messagebox.showerror("IOTA (CH2)", f"Failed: {e}")
+            return
+        messagebox.showinfo("IOTA", "CH2 configured. Press CH2 Trigger (front panel) to fire one shot.")
 
-# -----------------------------
-# Main
-# -----------------------------
+    def on_iota_to_ipm(self, gas_us: float, delay_ms: float):
+        # This button only sets CH2 config (same as above). Timing to IPM is manual.
+        self.on_iota_send(gas_us, delay_ms)
+
 if __name__ == "__main__":
     app = MainApp()
     app.mainloop()
