@@ -13,7 +13,10 @@ from pulse_schedule import Program, ChargePWM, Gap
 from export import export_sdg_csv
 from send_over_lan import (
     setup_iota_over_lan,
-    send_user_arb_over_lan,   # direct ARB over LAN
+    send_user_arb_over_lan,
+    set_output,              # (if you already added this earlier)
+    trigger_channel,       # only if used
+    ensure_outputs_off,      # <-- add this
 )
 
 SDG_HOST = "192.168.3.100"
@@ -165,16 +168,26 @@ class SequenceList(ttk.LabelFrame):
 # =========================
 class OptionsPane(ttk.LabelFrame):
     def __init__(self, master, on_preview, on_export, on_send,
-                 on_iota_send, on_iota_to_ipm):
+                 on_iota_send, on_iota_to_ipm,
+                 on_arm_changed, on_trigger):
         super().__init__(master, text="Options / Preview / Send (CH1 = IPM)")
-        self.on_preview, self.on_export, self.on_send = on_preview, on_export, on_send
-        self.on_iota_send, self.on_iota_to_ipm = on_iota_send, on_iota_to_ipm
+        # existing callbacks
+        self.on_preview     = on_preview
+        self.on_export      = on_export
+        self.on_send        = on_send
+        self.on_iota_send   = on_iota_send
+        self.on_iota_to_ipm = on_iota_to_ipm
+        # NEW callbacks
+        self.on_arm_changed = on_arm_changed
+        self.on_trigger     = on_trigger
 
-        self.spacing = tk.StringVar(value="0.0")
-        self.gas_us  = tk.StringVar(value="500.0")
-        self.delay_ms= tk.StringVar(value="0.0")
+        self.spacing  = tk.StringVar(value="0.0")
+        self.gas_us   = tk.StringVar(value="500.0")
+        self.delay_ms = tk.StringVar(value="0.0")
 
         g = ttk.Frame(self); g.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
+
+        # Top controls (unchanged)
         ttk.Label(g, text="Spacing between all blocks (µs)").grid(row=0, column=0, sticky="w")
         ttk.Entry(g, textvariable=self.spacing, width=10).grid(row=0, column=1, sticky="ew")
 
@@ -182,16 +195,27 @@ class OptionsPane(ttk.LabelFrame):
         ttk.Button(g, text="Export CSV (USB)", command=self._export).grid(row=2, column=0, columnspan=2, sticky="ew")
         ttk.Button(g, text="Send to SDG (LAN)", command=self._send).grid(row=3, column=0, columnspan=2, sticky="ew")
 
-        sep = ttk.Separator(g, orient="horizontal"); sep.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(10,6))
-        ttk.Label(g, text="IOTA (CH2)").grid(row=5, column=0, columnspan=2)
+        # NEW: Arm toggle + Trigger (Trigger only visible when armed)
+        self._armed = tk.BooleanVar(value=False)
+        ttk.Checkbutton(g, text="Arm (CH1 Output)", variable=self._armed, command=self._toggle_arm)\
+            .grid(row=4, column=0, columnspan=2, sticky="w", pady=(6,0))
 
-        ttk.Label(g, text="Gas Injection Duration (µs)").grid(row=6, column=0, sticky="w")
-        ttk.Entry(g, textvariable=self.gas_us, width=10).grid(row=6, column=1, sticky="ew")
-        ttk.Label(g, text="Delay to IPM (ms)").grid(row=7, column=0, sticky="w")
-        ttk.Entry(g, textvariable=self.delay_ms, width=10).grid(row=7, column=1, sticky="ew")
+        self.btn_trig = ttk.Button(g, text="Trigger (CH1)", command=self._trigger)
+        self.btn_trig.grid(row=5, column=0, columnspan=2, sticky="ew")
+        self.btn_trig.grid_remove()  # hidden until armed
 
-        ttk.Button(g, text="Send IOTA (CH2)", command=self._iota_send).grid(row=8, column=0, columnspan=2, sticky="ew", pady=(6,0))
-        ttk.Button(g, text="IOTA → IPM (coarse via LAN)", command=self._iota_to_ipm).grid(row=9, column=0, columnspan=2, sticky="ew")
+        # Separator + IOTA (shifted down by +2 rows to make room for Arm/Trigger)
+        sep = ttk.Separator(g, orient="horizontal"); sep.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(10,6))
+        ttk.Label(g, text="IOTA (CH2)").grid(row=7, column=0, columnspan=2)
+
+        ttk.Label(g, text="Gas Injection Duration (µs)").grid(row=8, column=0, sticky="w")
+        ttk.Entry(g, textvariable=self.gas_us, width=10).grid(row=8, column=1, sticky="ew")
+
+        ttk.Label(g, text="Delay to IPM (ms)").grid(row=9, column=0, sticky="w")
+        ttk.Entry(g, textvariable=self.delay_ms, width=10).grid(row=9, column=1, sticky="ew")
+
+        ttk.Button(g, text="Send IOTA (CH2)", command=self._iota_send).grid(row=10, column=0, columnspan=2, sticky="ew", pady=(6,0))
+        ttk.Button(g, text="IOTA → IPM (coarse via LAN)", command=self._iota_to_ipm).grid(row=11, column=0, columnspan=2, sticky="ew")
 
         g.columnconfigure(1, weight=1)
 
@@ -202,6 +226,29 @@ class OptionsPane(ttk.LabelFrame):
     def _preview(self): self.on_preview(self._spacing())
     def _export(self):  self.on_export(self._spacing())
     def _send(self):    self.on_send(self._spacing())
+
+    # NEW
+    def _toggle_arm(self):
+        armed = self._armed.get()
+        try:
+            self.on_arm_changed(armed)
+        except Exception as e:
+            # revert checkbox on failure
+            self._armed.set(not armed)
+            messagebox.showerror("Arm (CH1)", str(e))
+            return
+        # show/hide Trigger button
+        if armed:
+            self.btn_trig.grid()
+        else:
+            self.btn_trig.grid_remove()
+
+    # NEW
+    def _trigger(self):
+        try:
+            self.on_trigger()
+        except Exception as e:
+            messagebox.showerror("Trigger (CH1)", str(e))
 
     def _iota_send(self):
         try:
@@ -272,12 +319,22 @@ class MainApp(tk.Tk):
         self.seq.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
 
         self.opts = OptionsPane(
-            root, self.on_preview, self.on_export, self.on_send,
-            self.on_iota_send, self.on_iota_to_ipm
-        )
+            root,
+            self.on_preview, self.on_export, self.on_send,
+            self.on_iota_send, self.on_iota_to_ipm,
+            self.on_arm_changed, self.on_trigger   # NEW callbacks
+)
+
         self.opts.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
 
         self.plot = PlotPane(self); self.plot.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0,8))
+        
+    
+            # Initialize: only touch channels that are actually ON, then re-address CH1
+        try:
+            ensure_outputs_off(SDG_HOST, prefer_channel="C1")
+        except Exception as e:
+            print(f"[INIT] Non-fatal: ensure_outputs_off failed: {e}")
 
     def _on_select(self, p: ChargePWM): self.editor.set_fields_from_pulse(p)
 
@@ -353,6 +410,20 @@ class MainApp(tk.Tk):
 
     def on_iota_to_ipm(self, gas_us: float, delay_ms: float):
         self.on_iota_send(gas_us, delay_ms)
+
+    def on_arm_changed(self, armed: bool):
+        # Arm/disarm CH1 output on the SDG
+        try:
+            set_output(SDG_HOST, "C1", on=armed)
+        except Exception as e:
+            # Let OptionsPane revert the checkbox on error
+            raise RuntimeError(f"Failed to {'arm' if armed else 'disarm'} CH1: {e}")
+
+    def on_trigger(self):
+        # Issue a software trigger (works when channel is in burst/trigger mode)
+        trigger_channel(SDG_HOST, "C1")
+    
+
 
 if __name__ == "__main__":
     app = MainApp()

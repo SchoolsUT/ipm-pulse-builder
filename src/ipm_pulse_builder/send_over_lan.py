@@ -114,6 +114,12 @@ def send_user_arb_over_lan(
             sdg.write(f"{ch}:BSWV OFST,{ofst}V")
             time.sleep(0.1)
             r, H, L = _query_levels(sdg, ch)
+        
+        # Burst: single cycle, manual/software trigger source ---
+        sdg.write(f"{ch}:BTWV STATE,ON")
+        sdg.write(f"{ch}:BTWV MODE,TRIG")   # triggered burst (one record per trigger)
+        sdg.write(f"{ch}:BTWV NCYC,1")      # 1 cycle per trigger
+        sdg.write(f"{ch}:BTWV TRSR,MAN")    # manual/software trigger source
 
         sdg.write(f"{ch}:OUTP ON")
 
@@ -161,6 +167,71 @@ def setup_iota_over_lan(gas_us: float, delay_ms: float, host: str):
         # err = sdg.query("SYST:ERR?").strip()
         # if not err.startswith("0"):
         #     raise RuntimeError(f"IOTA error: {err}")
+    finally:
+        try: sdg.close()
+        except Exception: pass
+        try: rm.close()
+        except Exception: pass
+
+# --- Arm / Output and Trigger helpers (tiny, safe) ---
+def set_output(host: str, channel: str = "C1", on: bool = True) -> None:
+    import pyvisa
+    rm = pyvisa.ResourceManager("@py")
+    sdg = rm.open_resource(f"TCPIP0::{host}::INSTR")
+    sdg.timeout = 3000
+    sdg.write_termination = "\n"
+    sdg.read_termination  = "\n"
+    try:
+        sdg.write(f"{channel}:OUTP {'ON' if on else 'OFF'}")
+    finally:
+        try: sdg.close()
+        except: pass
+        try: rm.close()
+        except: pass
+
+
+def trigger_channel(host: str, channel: str = "C1") -> None:
+    import pyvisa
+    rm = pyvisa.ResourceManager("@py")
+    sdg = rm.open_resource(f"TCPIP0::{host}::INSTR")
+    sdg.timeout = 3000
+    sdg.write_termination = "\n"
+    sdg.read_termination  = "\n"
+    try:
+        sdg.write(f"{channel}:TRIG")
+    finally:
+        try: sdg.close()
+        except: pass
+        try: rm.close()
+        except: pass
+
+def ensure_outputs_off(host: str, prefer_channel: str = "C1") -> None:
+    """
+    Turn both outputs OFF, addressing the non-preferred channel first and the
+    preferred channel last so the SDG UI remains focused on the preferred one.
+    """
+    import pyvisa
+    rm = pyvisa.ResourceManager("@py")
+    sdg = rm.open_resource(f"TCPIP0::{host}::INSTR")
+    sdg.timeout = 3000
+    sdg.write_termination = "\n"
+    sdg.read_termination  = "\n"
+    try:
+        pref = prefer_channel.upper()
+        other = "C2" if pref == "C1" else "C1"
+
+        # Turn OFF the non-preferred channel first…
+        try:
+            sdg.write(f"{other}:OUTP OFF")
+        except Exception:
+            pass
+
+        # …then the preferred channel last, so the UI remains on it.
+        try:
+            sdg.write(f"{pref}:OUTP OFF")
+        except Exception:
+            pass
+
     finally:
         try: sdg.close()
         except Exception: pass
