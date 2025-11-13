@@ -1,87 +1,144 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import socket
-from contextlib import closing
+import socket, time, re
+from typing import Tuple
 
 DEFAULT_IP = "192.168.3.100"
-DEFAULT_PORT = 5025
-TIMEOUT = 3.0
+PORT = 5025
 
-def _send(ip: str, cmd: str) -> str:
-    with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
-        s.settimeout(TIMEOUT)
-        s.connect((ip, DEFAULT_PORT))
-        s.sendall((cmd if cmd.endswith("\n") else cmd + "\n").encode("ascii"))
-        return ""
+# ----------------
+# Low-level socket
+# ----------------
+def _open(ip: str, timeout_s: float = 12.0) -> socket.socket:
+    s = socket.create_connection((ip, PORT), timeout=timeout_s)
+    s.settimeout(timeout_s)
+    return s
 
-def _ask(ip: str, cmd: str) -> str:
-    with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
-        s.settimeout(TIMEOUT)
-        s.connect((ip, DEFAULT_PORT))
-        s.sendall((cmd if cmd.endswith("\n") else cmd + "\n").encode("ascii"))
-        # crude receive
-        s.settimeout(TIMEOUT)
-        data = s.recv(4096)
-        return data.decode(errors="ignore")
+def _send_line(s: socket.socket, cmd: str) -> None:
+    s.sendall(cmd.encode("ascii") + b"\n")
 
-# -----------------------------
-# Channel helpers (generic)
-# -----------------------------
+def _recv_line(s: socket.socket, maxlen: int = 16384) -> str:
+    chunks = []
+    while True:
+        b = s.recv(1)
+        if not b or b == b"\n":
+            break
+        chunks.append(b)
+        if len(chunks) >= maxlen:
+            break
+    return b"".join(chunks).decode("ascii", "ignore").strip()
 
+def _ask(s: socket.socket, cmd: str) -> str:
+    _send_line(s, cmd)
+    return _recv_line(s)
+
+# ----------------
+# Public helpers
+# ----------------
 def idn(ip: str = DEFAULT_IP) -> str:
-    return _ask(ip, "*IDN?")
+    s = _open(ip)
+    try:
+        return _ask(s, "*IDN?")
+    finally:
+        s.close()
 
-def clear(ip: str = DEFAULT_IP) -> None:
-    _send(ip, "*CLS")
-
-def set_load_hiz(ip: str = DEFAULT_IP, ch: int = 1) -> None:
-    _send(ip, f"C{ch}:OUTP ON")
-    # SDG1000X uses fixed load reporting; no direct Hi-Z command needed for output.
-    # Keep output enabled; levels are set via BSWV.
-
-def set_levels(ip: str, ch: int, high_v: float, low_v: float) -> None:
-    _send(ip, f"C{ch}:BSWV HLEV,{high_v}V,LLEV,{low_v}V")
-
-def set_arb_freq(ip: str, ch: int, freq_hz: float) -> None:
-    _send(ip, f"C{ch}:BSWV FRQ,{freq_hz}")
-
-def select_arb_mode(ip: str, ch: int) -> None:
-    _send(ip, f"C{ch}:BSWV WVTP,ARB")
-
-def output_on(ip: str, ch: int, on: bool = True) -> None:
-    _send(ip, f"C{ch}:OUTP {'ON' if on else 'OFF'}")
-
-def get_bswv(ip: str, ch: int) -> str:
-    return _ask(ip, f"C{ch}:BSWV?")
-
-# -----------------------------
-# CH2 = IOTA TTL (pulse + burst 1-shot)
-# -----------------------------
-
-def configure_iota_ttl(
-    ip: str = DEFAULT_IP,
-    gas_us: float = 500.0,       # pulse width
-    delay_ms: float = 0.0,       # hold-off before IPM (informational; LAN can’t cross-couple)
-    freq_hz: float = 1000.0,     # irrelevant for 1-cycle, but required by SDG
+def upload_user_wave_ram(
+    ip: str,
+    name: str,
+    payload_le_i16: bytes,   # little-endian int16 array (2*N bytes)
+    f_arb_hz: float,
     high_v: float = 5.0,
     low_v: float = 0.0,
+    channel: str = "C1",
+    load: str = "HiZ",
+) -> Tuple[float, str]:
+    """
+    Terminal-matching flow:
+      * *CLS; <ch>:OUTP OFF; <ch>:SRATE MODE,TARB
+      * One buffer: '<ch>:WVDT WVNM,<name>,TYPE,5,LENGTH,<L>B,...,WAVEDATA,' + raw bytes
+      * Select and format ARB, set FRQ, levels, load, OUTP ON
+    Returns (f_arb_hz, selected_name).
+    """
+    ch = channel.strip().upper()
+    if ch not in ("C1", "C2"):
+        raise ValueError("channel must be 'C1' or 'C2'")
+
+    s = _open(ip)
+    try:
+        _send_line(s, "*CLS")
+        _send_line(s, f"{ch}:OUTP OFF")
+        _send_line(s, f"{ch}:SRATE MODE,TARB")
+
+        L = len(payload_le_i16)
+        header = (
+            f"{ch}:WVDT WVNM,{name},TYPE,5,"
+            f"LENGTH,{L}B,FREQ,1000.000000,AMPL,2.000,OFST,0.000,PHASE,0.0,"
+            f"WAVEDATA,"
+        ).encode("ascii")
+
+        # EXACTLY like the working terminal: header + raw, no trailing '\n'
+        s.sendall(header + payload_le_i16)
+
+        time.sleep(0.4)  # allow ingest
+
+        # Select, set ARB + FRQ + LOAD
+        _send_line(s, f"{ch}:ARWV NAME,{name}")
+        _send_line(s, f"{ch}:BSWV WVTP,ARB")
+        _send_line(s, f"{ch}:BSWV FRQ,{f_arb_hz}")
+        _send_line(s, f"{ch}:BSWV LOAD,{load}")
+
+        # Prefer HLEV/LLEV; if they don't take, fallback to AMPL/OFST
+        def _query_levels():
+            r = _ask(s, f"{ch}:BSWV?")
+            mH = re.search(r"HLEV,([-\d\.eE]+)V", r)
+            mL = re.search(r"LLEV,([-\d\.eE]+)V", r)
+            H = float(mH.group(1)) if mH else None
+            L = float(mL.group(1)) if mL else None
+            return r, H, L
+
+        _send_line(s, f"{ch}:BSWV HLEV,{high_v}V")
+        _send_line(s, f"{ch}:BSWV LLEV,{low_v}V")
+        time.sleep(0.1)
+        r, H, L = _query_levels()
+        if H is None or L is None or abs(H - high_v) > 0.05 or abs(L - low_v) > 0.05:
+            amp = high_v - low_v
+            ofs = 0.5 * (high_v + low_v)
+            _send_line(s, f"{ch}:BSWV AMPL,{amp}V")
+            _send_line(s, f"{ch}:BSWV OFST,{ofs}V")
+            time.sleep(0.1)
+
+        _send_line(s, f"{ch}:OUTP ON")
+
+        # Report selected name
+        arwv = _ask(s, f"{ch}:ARWV?")
+        m = re.search(r'NAME,("?)(.+?)\1', arwv)
+        sel_name = m.group(2) if m else arwv
+
+        _ask(s, "SYST:ERR?")  # clear
+        return f_arb_hz, sel_name
+    finally:
+        s.close()
+
+def setup_iota_over_lan(
+    gas_us: float,
+    delay_ms: float = 0.0,
+    host: str = DEFAULT_IP,
+    channel: str = "C2",
 ) -> None:
-    ch = 2
-    # make sure no sweep/mod/burst leftovers, then set pulse
-    for feature in ("MDWV", "SWWV", "BTWV"):
-        _send(ip, f"C{ch}:{feature} STATE,OFF")
-    _send(ip, f"C{ch}:BSWV WVTP,PULSE")
-    _send(ip, f"C{ch}:BSWV FRQ,{freq_hz}")
-    _send(ip, f"C{ch}:BSWV WIDTH,{gas_us*1e-6:.9f}")   # seconds
-    _send(ip, f"C{ch}:BSWV HLEV,{high_v}V")
-    _send(ip, f"C{ch}:BSWV LLEV,{low_v}V")
+    """Simple PULSE on CH2 (IOTA TTL)."""
+    ch = channel.strip().upper()
+    if ch not in ("C1", "C2"):
+        raise ValueError("channel must be 'C1' or 'C2'")
 
-    # 1-shot burst, manual trigger
-    _send(ip, f"C{ch}:BTWV STATE,ON")
-    _send(ip, f"C{ch}:BTWV GATE_NCYC,NCYC")
-    _send(ip, f"C{ch}:BTWV TRSR,MAN")
-    _send(ip, f"C{ch}:BTWV NCYC,1")
-    _send(ip, f"C{ch}:OUTP ON")
-
-def fire_iota_once(ip: str = DEFAULT_IP) -> None:
-    _send(ip, "C2:BTWV MTRIG")
+    s = _open(host)
+    try:
+        _send_line(s, "*CLS")
+        _send_line(s, f"{ch}:OUTP OFF")
+        _send_line(s, f"{ch}:BSWV WVTP,PULSE")
+        _send_line(s, f"{ch}:BSWV WIDTH,{gas_us}US")
+        _send_line(s, f"{ch}:BSWV HLEV,5V")
+        _send_line(s, f"{ch}:BSWV LLEV,0V")
+        _send_line(s, f"{ch}:BSWV LOAD,HiZ")
+        _send_line(s, f"{ch}:OUTP ON")
+    finally:
+        s.close()

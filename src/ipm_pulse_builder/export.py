@@ -1,31 +1,28 @@
 #!/usr/bin/env python3
 from __future__ import annotations
+from typing import Tuple
 import csv
-from typing import Optional
-from pulse_schedule import Program
+from pathlib import Path
 
-def export_sdg_csv(program: Program, path: str, npoints: int = 4096) -> float:
-    """Export a Siglent-friendly CSV of equally-spaced amplitude samples in [-1,+1].
-       Returns the *suggested ARB frequency* (Hz) to reproduce the real time.
-       Siglent re-times the points by ARB frequency: f = N / T.
+# program: must provide duration_us() and sample(npoints) -> (t_us, y_pm1)
+def export_sdg_csv(program, path: str, npoints: int = 4096) -> float:
     """
-    T_us = program.duration_us()
-    if T_us <= 0:
-        # write a trivial two-point LOW file
-        with open(path, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow([ -1.0 ])
-            w.writerow([ -1.0 ])
-        return 1.0
+    Write Siglent 'Data' CSV with columns: Time(s), Ampl(V).
+    Uses ±1 amplitude; actual volts are set by High/Low on the SDG.
+    Returns the suggested ARB frequency (Hz) = 1 / total_duration.
+    """
+    total_us = float(program.duration_us())
+    if total_us <= 0.0:
+        raise ValueError("Program duration is zero.")
 
-    _, y = program.sample(npoints=npoints)
+    f_arb = 1.0 / (total_us * 1e-6)  # repeat once per program period
+    t_us, y_pm1 = program.sample(npoints=npoints)
 
-    # Single-column CSV of volt-normalized samples (-1..+1)
-    with open(path, "w", newline="") as f:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("w", newline="") as f:
         w = csv.writer(f)
-        for v in y:
-            w.writerow([f"{v:.6f}"])
-
-    T_sec = T_us * 1e-6
-    arb_freq = (len(y) / T_sec) if T_sec > 0 else 1.0
-    return arb_freq
+        w.writerow(["Time(s)", "Ampl(V)"])
+        for tu, a in zip(t_us, y_pm1):
+            w.writerow([f"{tu*1e-6:.12g}", f"{a:.6g}"])
+    return f_arb

@@ -11,7 +11,13 @@ from matplotlib.figure import Figure
 
 from pulse_schedule import Program, ChargePWM, Gap
 from export import export_sdg_csv
-from send_over_lan import send_program_over_lan, setup_iota_over_lan
+from send_over_lan import (
+    setup_iota_over_lan,
+    send_user_arb_over_lan,   # direct ARB over LAN
+)
+
+SDG_HOST = "192.168.3.100"
+LAN_NPOINTS = 2048  # points used when uploading over LAN (can set to 4096 if you want)
 
 def f3(x: float) -> str: return f"{x:.3f}"
 
@@ -239,7 +245,6 @@ class PlotPane(ttk.LabelFrame):
         dt = T / (len(t_us) - 1)
         I, cur = [], 0.0
         tau_on = 50.0; tau_off = 100.0; Imax = 85.0
-        # reconstruct HIGH windows from samples
         for v in y:
             if v > 0:
                 cur += (Imax - cur) * (1 - math.exp(-dt/tau_on))
@@ -284,7 +289,6 @@ class MainApp(tk.Tk):
     # ---- program assembly ----
     def _build_program(self, spacing_us: float) -> Program:
         prog = Program()
-        # spacing_us is an extra GAP between items
         first = True
         for it in self.seq.items:
             if not first and spacing_us > 0:
@@ -320,28 +324,34 @@ class MainApp(tk.Tk):
             messagebox.showwarning("Send", "Sequence is empty."); return
         prog = self._build_program(spacing_us)
         try:
-            arb_f = send_program_over_lan(prog)  # CH1 only sets freq/levels
+            f_arb, npts = send_user_arb_over_lan(
+                program=prog,
+                host=SDG_HOST,
+                channel="C1",
+                name="ipm_gui",
+                npoints=LAN_NPOINTS,
+                high_v=5.0, low_v=0.0, load="HiZ"
+            )
         except Exception as e:
             messagebox.showerror("Send to SDG (LAN)", f"Failed: {e}")
             return
         messagebox.showinfo("Sent",
-            f"LAN setup complete for CH1\n"
+            f"Wave uploaded & selected on CH1\n"
+            f"Points: {npts}\n"
             f"Total duration: {prog.duration_us():.3f} µs\n"
-            f"ARB frequency set to {arb_f:.2f} Hz\n"
-            "Levels: High 5.0 V / Low 0.0 V / Load Hi-Z\n\n"
-            "REMINDER: select your CSV on the SDG from USB first.")
+            f"ARB frequency set to {f_arb:.2f} Hz\n"
+            "Levels: High 5.0 V / Low 0.0 V / Load Hi-Z")
 
     # IOTA (CH2)
     def on_iota_send(self, gas_us: float, delay_ms: float):
         try:
-            setup_iota_over_lan(gas_us=gas_us, delay_ms=delay_ms)
+            setup_iota_over_lan(gas_us=gas_us, delay_ms=delay_ms, host=SDG_HOST)
         except Exception as e:
             messagebox.showerror("IOTA (CH2)", f"Failed: {e}")
             return
         messagebox.showinfo("IOTA", "CH2 configured. Press CH2 Trigger (front panel) to fire one shot.")
 
     def on_iota_to_ipm(self, gas_us: float, delay_ms: float):
-        # This button only sets CH2 config (same as above). Timing to IPM is manual.
         self.on_iota_send(gas_us, delay_ms)
 
 if __name__ == "__main__":
