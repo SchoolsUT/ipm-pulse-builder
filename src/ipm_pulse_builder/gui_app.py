@@ -22,6 +22,11 @@ from send_over_lan import (
 from calibration_io import list_load_ids, list_voltages_for_load, get_or_build_model
 from predictor import predict_current_from_gate
 
+# add to existing imports
+from tek_scope import scope_capture_and_fetch, save_scope_csv_combined
+
+# put near SDG_HOST
+TEK_HOST = "192.168.3.101"   
 SDG_HOST = "192.168.3.100"
 
 def f3(x: float) -> str: return f"{x:.3f}"
@@ -172,7 +177,8 @@ class OptionsPane(ttk.LabelFrame):
     def __init__(self, master, on_preview, on_export, on_send,
                  on_iota_send, on_iota_to_ipm,
                  on_arm_changed=None, on_trigger=None,
-                 on_cal_refresh=None, on_cal_load_changed=None, on_cal_voltage_changed=None):
+                 on_cal_refresh=None, on_cal_load_changed=None, on_cal_voltage_changed=None,
+                 on_scope_grab=None):   
         super().__init__(master, text="Options / Preview / Send (CH1 = IPM)")
         self.on_preview, self.on_export, self.on_send = on_preview, on_export, on_send
         self.on_iota_send, self.on_iota_to_ipm = on_iota_send, on_iota_to_ipm
@@ -181,6 +187,7 @@ class OptionsPane(ttk.LabelFrame):
         self.on_cal_refresh = on_cal_refresh
         self.on_cal_load_changed = on_cal_load_changed
         self.on_cal_voltage_changed = on_cal_voltage_changed
+        self.on_scope_grab = on_scope_grab
 
         self.spacing  = tk.StringVar(value="0.0")
         self.gas_us   = tk.StringVar(value="500.0")
@@ -212,6 +219,8 @@ class OptionsPane(ttk.LabelFrame):
         ttk.Button(g, text="Preview", command=self._preview).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8,0))
         ttk.Button(g, text="Export CSV (USB)", command=self._export).grid(row=2, column=0, columnspan=2, sticky="ew")
         ttk.Button(g, text="Send to SDG (LAN)", command=self._send).grid(row=3, column=0, columnspan=2, sticky="ew")
+
+        ttk.Button(g, text="Grab Scope CSVs", command=self._scope_grab).grid(row=4, column=0, columnspan=2, sticky="ew", pady=(6,0))
 
         # Arm/Trigger (only shown if callbacks provided)
         row = 4
@@ -305,6 +314,13 @@ class OptionsPane(ttk.LabelFrame):
             self.on_iota_to_ipm(gas, dms)
         except Exception as e:
             messagebox.showerror("IOTA", str(e))
+    
+    def _scope_grab(self):
+        try:
+            if self.on_scope_grab:
+                self.on_scope_grab()
+        except Exception as e:
+            messagebox.showerror("Tek Scope", str(e))
 
 # =========================
 # Preview panel
@@ -361,6 +377,7 @@ class MainApp(tk.Tk):
             on_cal_refresh=self._cal_refresh,
             on_cal_load_changed=self._cal_load_changed,
             on_cal_voltage_changed=self._cal_voltage_changed,
+            on_scope_grab=self.on_scope_grab,   
         )
         self.opts.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
 
@@ -527,6 +544,38 @@ class MainApp(tk.Tk):
     def on_trigger(self):
         # Issue a software trigger (works when channel is in burst/trigger mode)
         trigger_channel(SDG_HOST, "C1")
+    
+    def on_scope_grab(self):
+        # Pick a folder to save the combined CSV
+        out_dir = filedialog.askdirectory(title="Choose folder for Tek CSV")
+        if not out_dir:
+            return
+        try:
+            # Auto-detect active channels; do NOT clear or re-arm the scope
+            data = scope_capture_and_fetch(
+                host=TEK_HOST,
+                sources=None,                 # auto-detect which CHx are ON
+                single_sequence=False,        # just read what's on-screen
+                # record_length=1_000_000,    # optional
+                # average_count=16,           # optional
+            )
+            out_csv = os.path.join(out_dir, "tek_all.csv")
+            save_scope_csv_combined(data, out_csv, align="truncate")
+            messagebox.showinfo("Tek Scope", f"Saved combined CSV:\n{out_csv}")
+        except Exception as e:
+            messagebox.showerror("Tek Scope", str(e))
+
+    def on_scope_capture(self):
+        try:
+            cap = scope_capture_and_fetch(host="192.168.3.101", sources=None, single_sequence=False)
+            out_dir = os.path.join(os.getcwd(), "tek_captures")
+            os.makedirs(out_dir, exist_ok=True)
+            out_csv = os.path.join(out_dir, "tek_all.csv")
+            save_scope_csv_combined(cap, out_csv, align="truncate")
+            messagebox.showinfo("Tek Capture", f"Saved combined CSV:\n{out_csv}")
+        except Exception as e:
+            messagebox.showerror("Tek Capture", str(e))
+
     
 
 
