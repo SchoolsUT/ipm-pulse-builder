@@ -3,6 +3,7 @@ from __future__ import annotations
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import csv, tempfile, os
+from typing import Dict, Any, cast
 
 import matplotlib
 matplotlib.use("TkAgg")
@@ -18,9 +19,10 @@ from send_over_lan import (
     trigger_channel,       # only if used
     ensure_outputs_off,      # <-- add this
 )
+from calibration_io import list_load_ids, list_voltages_for_load, get_or_build_model
+from predictor import predict_current_from_gate
 
 SDG_HOST = "192.168.3.100"
-LAN_NPOINTS = 2048  # points used when uploading over LAN (can set to 4096 if you want)
 
 def f3(x: float) -> str: return f"{x:.3f}"
 
@@ -169,25 +171,41 @@ class SequenceList(ttk.LabelFrame):
 class OptionsPane(ttk.LabelFrame):
     def __init__(self, master, on_preview, on_export, on_send,
                  on_iota_send, on_iota_to_ipm,
-                 on_arm_changed, on_trigger):
+                 on_arm_changed=None, on_trigger=None,
+                 on_cal_refresh=None, on_cal_load_changed=None, on_cal_voltage_changed=None):
         super().__init__(master, text="Options / Preview / Send (CH1 = IPM)")
-        # existing callbacks
-        self.on_preview     = on_preview
-        self.on_export      = on_export
-        self.on_send        = on_send
-        self.on_iota_send   = on_iota_send
-        self.on_iota_to_ipm = on_iota_to_ipm
-        # NEW callbacks
+        self.on_preview, self.on_export, self.on_send = on_preview, on_export, on_send
+        self.on_iota_send, self.on_iota_to_ipm = on_iota_send, on_iota_to_ipm
         self.on_arm_changed = on_arm_changed
-        self.on_trigger     = on_trigger
+        self.on_trigger = on_trigger
+        self.on_cal_refresh = on_cal_refresh
+        self.on_cal_load_changed = on_cal_load_changed
+        self.on_cal_voltage_changed = on_cal_voltage_changed
 
         self.spacing  = tk.StringVar(value="0.0")
         self.gas_us   = tk.StringVar(value="500.0")
         self.delay_ms = tk.StringVar(value="0.0")
 
+        # --- Calibration mini-panel (compact, first row) ---
+        cal = ttk.Frame(self); cal.pack(fill=tk.X, padx=10, pady=(8,2))
+        ttk.Label(cal, text="Load").grid(row=0, column=0, sticky="w")
+        self.cb_load = ttk.Combobox(cal, state="readonly", width=16, values=[])
+        self.cb_load.grid(row=0, column=1, sticky="ew", padx=(4,8))
+        self.cb_load.bind("<<ComboboxSelected>>", lambda e: self.on_cal_load_changed and self.on_cal_load_changed(self.cb_load.get()))
+        ttk.Label(cal, text="V").grid(row=0, column=2, sticky="w")
+        self.cb_volt = ttk.Combobox(cal, state="readonly", width=8, values=[])
+        self.cb_volt.grid(row=0, column=3, sticky="ew", padx=(4,8))
+        self.cb_volt.bind("<<ComboboxSelected>>", lambda e: self.on_cal_voltage_changed and self.on_cal_voltage_changed(self.cb_volt.get()))
+        ttk.Button(cal, text="Refresh", command=lambda: self.on_cal_refresh and self.on_cal_refresh()).grid(row=0, column=4, sticky="ew")
+        cal.columnconfigure(1, weight=1)
+
+        # Warning banner (hidden by default)
+        self.warn = ttk.Label(self, text="", foreground="#7a4d00", background="#fff3cd")
+        self.warn.pack(fill=tk.X, padx=10, pady=(0,6))
+        self.warn.pack_forget()
+
         g = ttk.Frame(self); g.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
 
-        # Top controls (unchanged)
         ttk.Label(g, text="Spacing between all blocks (µs)").grid(row=0, column=0, sticky="w")
         ttk.Entry(g, textvariable=self.spacing, width=10).grid(row=0, column=1, sticky="ew")
 
@@ -195,30 +213,58 @@ class OptionsPane(ttk.LabelFrame):
         ttk.Button(g, text="Export CSV (USB)", command=self._export).grid(row=2, column=0, columnspan=2, sticky="ew")
         ttk.Button(g, text="Send to SDG (LAN)", command=self._send).grid(row=3, column=0, columnspan=2, sticky="ew")
 
-        # NEW: Arm toggle + Trigger (Trigger only visible when armed)
-        self._armed = tk.BooleanVar(value=False)
-        ttk.Checkbutton(g, text="Arm (CH1 Output)", variable=self._armed, command=self._toggle_arm)\
-            .grid(row=4, column=0, columnspan=2, sticky="w", pady=(6,0))
+        # Arm/Trigger (only shown if callbacks provided)
+        row = 4
+        if self.on_arm_changed is not None:
+            self._armed = tk.BooleanVar(value=False)
+            ttk.Checkbutton(g, text="Arm (CH1 Output)", variable=self._armed, command=self._toggle_arm)\
+                .grid(row=row, column=0, columnspan=2, sticky="w", pady=(6,0))
+            row += 1
+            if self.on_trigger is not None:
+                self.btn_trig = ttk.Button(g, text="Trigger (CH1)", command=self._trigger) #ERROR HERE AT "self._trigger"
+                self.btn_trig.grid(row=row, column=0, columnspan=2, sticky="ew")
+                self.btn_trig.grid_remove()
+                row += 1
 
-        self.btn_trig = ttk.Button(g, text="Trigger (CH1)", command=self._trigger)
-        self.btn_trig.grid(row=5, column=0, columnspan=2, sticky="ew")
-        self.btn_trig.grid_remove()  # hidden until armed
+        sep = ttk.Separator(g, orient="horizontal"); sep.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(10,6))
+        row += 1
+        ttk.Label(g, text="IOTA (CH2)").grid(row=row, column=0, columnspan=2); row += 1
 
-        # Separator + IOTA (shifted down by +2 rows to make room for Arm/Trigger)
-        sep = ttk.Separator(g, orient="horizontal"); sep.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(10,6))
-        ttk.Label(g, text="IOTA (CH2)").grid(row=7, column=0, columnspan=2)
+        ttk.Label(g, text="Gas Injection Duration (µs)").grid(row=row, column=0, sticky="w")
+        ttk.Entry(g, textvariable=self.gas_us, width=10).grid(row=row, column=1, sticky="ew"); row += 1
+        ttk.Label(g, text="Delay to IPM (ms)").grid(row=row, column=0, sticky="w")
+        ttk.Entry(g, textvariable=self.delay_ms, width=10).grid(row=row, column=1, sticky="ew"); row += 1
 
-        ttk.Label(g, text="Gas Injection Duration (µs)").grid(row=8, column=0, sticky="w")
-        ttk.Entry(g, textvariable=self.gas_us, width=10).grid(row=8, column=1, sticky="ew")
-
-        ttk.Label(g, text="Delay to IPM (ms)").grid(row=9, column=0, sticky="w")
-        ttk.Entry(g, textvariable=self.delay_ms, width=10).grid(row=9, column=1, sticky="ew")
-
-        ttk.Button(g, text="Send IOTA (CH2)", command=self._iota_send).grid(row=10, column=0, columnspan=2, sticky="ew", pady=(6,0))
-        ttk.Button(g, text="IOTA → IPM (coarse via LAN)", command=self._iota_to_ipm).grid(row=11, column=0, columnspan=2, sticky="ew")
+        ttk.Button(g, text="Send IOTA (CH2)", command=self._iota_send).grid(row=row, column=0, columnspan=2, sticky="ew", pady=(6,0)); row += 1 #ERROR HERE AT "self._iota_send"
+        ttk.Button(g, text="IOTA → IPM (coarse via LAN)", command=self._iota_to_ipm).grid(row=row, column=0, columnspan=2, sticky="ew") #ERROR HERE AT "self._iota_to_ipm"
 
         g.columnconfigure(1, weight=1)
 
+    # External helpers for MainApp to control UI
+    def set_cal_lists(self, loads: list[str], volts: list[int], cur_load: str | None, cur_volt: int | None):
+        self.cb_load["values"] = loads
+        if cur_load in loads:
+            self.cb_load.set(cur_load)
+        elif loads:
+            self.cb_load.set(loads[0])
+        else:
+            self.cb_load.set("")
+        self.cb_volt["values"] = [str(v) for v in volts]
+        if cur_volt and str(cur_volt) in self.cb_volt["values"]:
+            self.cb_volt.set(str(cur_volt))
+        elif volts:
+            self.cb_volt.set(str(volts[0]))
+        else:
+            self.cb_volt.set("")
+
+    def set_model_warning(self, visible: bool, text: str = ""):
+        if visible:
+            self.warn.configure(text=text)
+            self.warn.pack(fill=tk.X, padx=10, pady=(0,6))
+        else:
+            self.warn.pack_forget()
+
+    # Existing behavior below
     def _spacing(self) -> float:
         try: return float(self.spacing.get() or 0.0)
         except: return 0.0
@@ -227,26 +273,20 @@ class OptionsPane(ttk.LabelFrame):
     def _export(self):  self.on_export(self._spacing())
     def _send(self):    self.on_send(self._spacing())
 
-    # NEW
     def _toggle_arm(self):
         armed = self._armed.get()
         try:
-            self.on_arm_changed(armed)
+            if self.on_arm_changed: self.on_arm_changed(armed)
         except Exception as e:
-            # revert checkbox on failure
-            self._armed.set(not armed)
-            messagebox.showerror("Arm (CH1)", str(e))
-            return
-        # show/hide Trigger button
-        if armed:
-            self.btn_trig.grid()
-        else:
-            self.btn_trig.grid_remove()
+            self._armed.set(not armed)  # revert on failure
+            messagebox.showerror("Arm (CH1)", str(e)); return
+        if hasattr(self, "btn_trig"):
+            if armed: self.btn_trig.grid()
+            else: self.btn_trig.grid_remove()
 
-    # NEW
     def _trigger(self):
         try:
-            self.on_trigger()
+            if self.on_trigger: self.on_trigger()
         except Exception as e:
             messagebox.showerror("Trigger (CH1)", str(e))
 
@@ -279,29 +319,18 @@ class PlotPane(ttk.LabelFrame):
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
     def show_from_csv(self, program: Program, npoints: int = 4096):
-        # generate the SAME data we export
+        # Draw ONLY the gate; leave bottom axis empty here.
         t_us, y = program.sample(npoints)
         self.ax1.clear(); self.ax2.clear()
         self.ax1.plot(t_us, y)
         self.ax1.set_ylabel("IPM Input (±1)")
         self.ax1.set_ylim(-1.1, 1.1)
 
-        # simple rise/decay placeholder current
-        import math
-        T = max(program.duration_us(), 1e-9)
-        dt = T / (len(t_us) - 1)
-        I, cur = [], 0.0
-        tau_on = 50.0; tau_off = 100.0; Imax = 85.0
-        for v in y:
-            if v > 0:
-                cur += (Imax - cur) * (1 - math.exp(-dt/tau_on))
-            else:
-                cur -= cur * (1 - math.exp(-dt/tau_off))
-            I.append(max(0.0, cur))
-        self.ax2.plot(t_us, I)
+        # Do not draw predictor here. on_preview() will handle it if a model exists.
         self.ax2.set_ylabel("Predicted Discharge Current (A)")
         self.ax2.set_xlabel("Time (µs)")
         self.canvas.draw_idle()
+
 
 # =========================
 # Main app wiring
@@ -318,12 +347,25 @@ class MainApp(tk.Tk):
         self.seq = SequenceList(root, self._on_select)
         self.seq.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
 
+        self.model_ok = False
+        self.model = None
+        self._ack_no_model = False
+        self.cal_load = None
+        self.cal_voltage = None
+
         self.opts = OptionsPane(
             root,
             self.on_preview, self.on_export, self.on_send,
             self.on_iota_send, self.on_iota_to_ipm,
-            self.on_arm_changed, self.on_trigger   # NEW callbacks
-)
+            self.on_arm_changed, self.on_trigger,
+            on_cal_refresh=self._cal_refresh,
+            on_cal_load_changed=self._cal_load_changed,
+            on_cal_voltage_changed=self._cal_voltage_changed,
+        )
+        self.opts.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        # Populate calibration lists on startup
+        self._cal_refresh()
 
         self.opts.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
 
@@ -354,10 +396,65 @@ class MainApp(tk.Tk):
             first = False
         return prog
 
+    def _cal_refresh(self):
+        loads = list_load_ids()
+        # Keep prior selection if possible
+        cur_load = self.cal_load if (self.cal_load in loads) else (loads[0] if loads else None)
+        volts = list_voltages_for_load(cur_load) if cur_load else []
+        cur_volt = self.cal_voltage if (self.cal_voltage in volts) else (volts[0] if volts else None)
+        self.cal_load, self.cal_voltage = cur_load, cur_volt
+        self.opts.set_cal_lists(loads, volts, cur_load, cur_volt)
+        self._load_model_and_set_banner()
+
+    def _cal_load_changed(self, load_id: str):
+        self.cal_load = load_id or None
+        volts = list_voltages_for_load(self.cal_load) if self.cal_load else []
+        self.cal_voltage = volts[0] if volts else None
+        self.opts.set_cal_lists(list_load_ids(), volts, self.cal_load, self.cal_voltage)
+        self._load_model_and_set_banner()
+
+    def _cal_voltage_changed(self, volt_str: str):
+        try:
+            self.cal_voltage = int(volt_str) if volt_str else None
+        except Exception:
+            self.cal_voltage = None
+        self._load_model_and_set_banner()
+
+    def _load_model_and_set_banner(self):
+        self._ack_no_model = False  # reset one-time confirm
+        if not self.cal_load or self.cal_voltage is None:
+            self.model_ok, self.model = False, None
+            self.opts.set_model_warning(True, "No calibration model selected. Preview predictor disabled.")
+            return
+
+        ok, res = get_or_build_model(self.cal_load, self.cal_voltage)
+        if ok:
+            self.model_ok, self.model = True, res
+            self.opts.set_model_warning(False, "")
+        else:
+            self.model_ok, self.model = False, None
+            self.opts.set_model_warning(
+                True,
+                f"No calibration model for {self.cal_load} @ {self.cal_voltage} V. "
+                "Place a CSV in cal/<load>/<V>V/ (e.g., 600V.csv) to auto-build."
+            )
+
     # ---- UI handlers ----
     def on_preview(self, spacing_us: float):
         prog = self._build_program(spacing_us)
+        # Always draw the gate on top axes
         self.plot.show_from_csv(prog)
+
+        # Only overlay current predictor if a valid model exists
+        if self.model_ok and self.model:
+            t_us, gate_y = prog.sample(4096)  # preview resolution only
+            t_pred, I_pred = predict_current_from_gate(list(t_us), list(gate_y), self.model)
+            self.plot.ax2.clear()
+            self.plot.ax2.plot(t_pred, I_pred)
+            self.plot.ax2.set_ylabel("Predicted Discharge Current (A)")
+            self.plot.ax2.set_xlabel("Time (µs)")
+            self.plot.canvas.draw_idle()
+
 
     def on_export(self, spacing_us: float):
         if not self.seq.items:
@@ -374,9 +471,18 @@ class MainApp(tk.Tk):
             f"Total duration: {prog.duration_us():.3f} µs\n"
             f"Suggested ARB frequency: {arb_f:.2f} Hz\n\n"
             "On the SDG:\n• Store/Recall → File Type: Data → select CSV on USB\n"
-            "• Set ARB Frequency to the value above\n• Set High=5 V, Low=0 V, Load=Hi-Z")
+            "• Set ARB Frequency to the value above\n• Set High=5 V, Low=0 V, Load=50 Ohm")
 
     def on_send(self, spacing_us: float):
+        if not self._ack_no_model and not self.model_ok:
+            if not messagebox.askyesno(
+                "No calibration model",
+                "No calibration model is loaded for the selected load/voltage.\n"
+                "IPM safety limits still apply, but current prediction is disabled.\n\n"
+                "Proceed anyway?"
+            ):
+                return
+            self._ack_no_model = True
         if not self.seq.items:
             messagebox.showwarning("Send", "Sequence is empty."); return
         prog = self._build_program(spacing_us)
@@ -386,8 +492,7 @@ class MainApp(tk.Tk):
                 host=SDG_HOST,
                 channel="C1",
                 name="ipm_gui",
-                npoints=LAN_NPOINTS,
-                high_v=5.0, low_v=0.0, load="HiZ"
+                high_v=5.0, low_v=0.0, load="50"
             )
         except Exception as e:
             messagebox.showerror("Send to SDG (LAN)", f"Failed: {e}")

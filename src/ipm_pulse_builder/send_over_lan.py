@@ -41,6 +41,66 @@ def _query_levels(sdg, ch: str) -> tuple[str, float | None, float | None]:
     L = float(mL.group(1)) if mL else None
     return r, H, L
 
+# SDG effective ARB sample rate (empirical for SDG1062X)
+SDG_ARB_FS = 30_000_000
+_ALLOWED_ARBLENS = (64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384)
+
+def _pick_npoints_from_waveform(t_us, y, target_samples_on_min_high: int = 8, requested_n: int | None = None) -> int:
+    """
+    Choose npoints based on the *actual* waveform you just generated.
+      - Fits the full record into the SDG's fixed ARB sample rate (N <= T * fs)
+      - Ensures the *shortest high pulse* is captured with >= target_samples_on_min_high samples
+      - Snaps to allowed lengths the SDG likes (powers of two)
+
+    Returns a single integer npoints to use for the *final* sampling/upload.
+    """
+    if not t_us or not y or len(t_us) != len(y):
+        return _ALLOWED_ARBLENS[0]
+
+    T_us = float(t_us[-1] - t_us[0])
+    if T_us <= 0:
+        return _ALLOWED_ARBLENS[0]
+
+    # Find shortest continuous HIGH segment in the provisional waveform
+    min_high_us = None
+    in_high = y[0] > 0
+    start_t = t_us[0] if in_high else None
+    for i in range(1, len(y)):
+        v = y[i] > 0
+        if not in_high and v:
+            in_high = True
+            start_t = t_us[i]
+        elif in_high and not v:
+            dur = t_us[i] - (start_t if start_t is not None else t_us[i])
+            min_high_us = dur if (min_high_us is None or dur < min_high_us) else min_high_us
+            in_high = False
+            start_t = None
+    if in_high and start_t is not None:
+        dur = t_us[-1] - start_t
+        min_high_us = dur if (min_high_us is None or dur < min_high_us) else min_high_us
+
+    # Fit constraints
+    n_fit_max = int((T_us * 1e-6) * SDG_ARB_FS)  # cannot exceed this or SDG will stretch/override
+    if n_fit_max < _ALLOWED_ARBLENS[0]:
+        return _ALLOWED_ARBLENS[0]
+
+    # If user requested and it fits both duration and allowed set, honor it
+    if requested_n and requested_n in _ALLOWED_ARBLENS and requested_n <= n_fit_max:
+        return requested_n
+
+    # Ensure enough samples on the *shortest* high pulse
+    if min_high_us and min_high_us > 0:
+        # Samples on min-high = N * (min_high_us / T_us)  ⇒  N >= target * (T_us / min_high_us)
+        n_min_for_high = int((target_samples_on_min_high * T_us) / min_high_us + 0.9999)
+        # Snap to largest allowed that satisfies both (<= n_fit_max and >= n_min_for_high)
+        candidates = [a for a in _ALLOWED_ARBLENS if a <= n_fit_max and a >= n_min_for_high]
+        if candidates:
+            return candidates[-1]
+
+    # Otherwise just take the largest allowed that fits in duration
+    candidates = [a for a in _ALLOWED_ARBLENS if a <= n_fit_max]
+    return candidates[-1]
+
 def send_user_arb_over_lan(
     program,
     host: str = DEFAULT_IP,
@@ -49,25 +109,38 @@ def send_user_arb_over_lan(
     npoints: int = 2048,
     high_v: float = 5.0,
     low_v: float = 0.0,
-    load: str = "HiZ",
+    load: str = "50",
 ) -> Tuple[float, int]:
     ch = channel.strip().upper()
     if ch not in ("C1", "C2"):
         raise ValueError("channel must be 'C1' or 'C2'")
 
     duration_us = max(program.duration_us(), 1e-9)
-    if not npoints:
-        npoints = _choose_points(duration_us)
 
-    t_us, y = program.sample(npoints)
+    # Probe once to measure true record and shortest HIGH segment
+    t_probe, y_probe = program.sample(512)  # cheap, fast
+
+    # Pick final npoints: honor an explicit npoints if it fits; otherwise downselect
+    npoints_final = _pick_npoints_from_waveform(
+        t_probe, y_probe,
+        target_samples_on_min_high=8,
+        requested_n=npoints  # <- keeps caller's choice when valid
+    )
+
+    # Build the payload with the chosen length
+    t_us, y = program.sample(npoints_final)
+
+    # Frequency must match intended duration (what preview uses)
+    f_arb = 1.0 / (duration_us * 1e-6)
+
     y = list(y)
     _force_low_edges(y)
 
     payload = _map_pm1_to_i16(y)
 
     # Record repeat rate (Hz) from total record length
-    T_us = (t_us[-1] - t_us[0]) if len(t_us) > 1 else duration_us
-    f_arb = 1e6 / max(T_us, 1e-6)
+    T_us_true = program.duration_us()
+    f_arb = 1.0 / (T_us_true * 1e-6)
 
     # ------- EXACT terminal-equivalent VISA session -------
     rm = pyvisa.ResourceManager()
@@ -98,6 +171,17 @@ def send_user_arb_over_lan(
         # Select & configure ARB, frequency, load
         sdg.write(f"{ch}:ARWV NAME,{name}")
         sdg.write(f"{ch}:BSWV WVTP,ARB")
+        # ---- Minimal load set (do not toggle outputs, do not reorder anything) ----
+        load_norm = (load or "").strip().upper()
+        if load_norm in ("50", "50OHM"):
+            # Some firmware honors OUTP, some reflects in BSWV — do both, no state flips
+            sdg.write(f"{ch}:OUTP LOAD,50")
+            sdg.write(f"{ch}:BSWV LOAD,50")
+        else:
+            sdg.write(f"{ch}:OUTP LOAD,HZ")
+            sdg.write(f"{ch}:BSWV LOAD,HiZ")
+# ---------------------------------------------------------------------------
+
         sdg.write(f"{ch}:BSWV FRQ,{f_arb}")
         sdg.write(f"{ch}:BSWV LOAD,{load}")
 
@@ -133,7 +217,7 @@ def send_user_arb_over_lan(
             # Not fatal—some firmwares echo index or .bin—just return the rate
             pass
 
-        return f_arb, npoints
+        return f_arb, npoints_final
 
     finally:
         try:
