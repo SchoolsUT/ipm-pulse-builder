@@ -81,23 +81,31 @@ class ChargePWM(Block):
 
         # PWM cycles
         pw = max(float(self.pwm_width_us), 0.0)
+        # PWM cycles (LOW-first so charge can fall LOW before first PWM HIGH)
         pp = max(float(self.pwm_period_us), 0.0)
         n  = max(int(self.pwm_count), 0)
+
         for _ in range(n):
-            # high
-            if pw > 0:
-                t1 = min(t0 + pw, t0 + pp) if pp > 0 else t0 + pw
-                segs.append((t0, t1, HIGH))
-            else:
-                t1 = t0
-            # low (rest of the period)
             if pp > 0:
-                t2 = t0 + pp
-                if t2 > t1:
-                    segs.append((t1, t2, LOW))
-                t0 = t2
+                low_d = max(pp - pw, 0.0)
+                t_high_start = t0 + low_d
+                t_period_end = t0 + pp
+
+                # LOW portion
+                if t_high_start > t0:
+                    segs.append((t0, t_high_start, LOW))
+
+                # HIGH portion (at end of period)
+                if pw > 0 and t_period_end > t_high_start:
+                    segs.append((t_high_start, t_period_end, HIGH))
+
+                t0 = t_period_end
             else:
-                t0 = t1
+                # Degenerate case: period=0 -> just emit a HIGH of width pw
+                if pw > 0:
+                    segs.append((t0, t0 + pw, HIGH))
+                    t0 = t0 + pw
+
 
         # Now uniformly sample T with npoints and map to levels
         dt = T / (npoints - 1)
