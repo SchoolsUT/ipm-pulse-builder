@@ -1,3 +1,6 @@
 matplotlib
 numpy
 pillow
+pyvisa
+pyvisa-py
+pyserial
