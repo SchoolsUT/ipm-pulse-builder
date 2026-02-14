@@ -87,7 +87,7 @@ def send_user_arb_over_lan(
     npoints: int = 2048,
     high_v: float = 5.0,
     low_v: float = 0.0,
-    load: str = "HiZ",
+    load: str = "50",
 ) -> Tuple[float, int]:
     ch = channel.strip().upper()
     if ch not in ("C1", "C2"):
@@ -141,7 +141,7 @@ def send_user_arb_over_lan(
         sdg.write(f"{ch}:ARWV NAME,{name}")
         sdg.write(f"{ch}:BSWV WVTP,ARB")
         sdg.write(f"{ch}:BSWV FRQ,{f_arb}")
-        sdg.write(f"{ch}:BSWV LOAD,{load}")
+        sdg.write(f"{ch}:OUTP LOAD,{load}")
 
         # Levels: set H/L explicitly; fallback to AMPL/OFST if needed
         sdg.write(f"{ch}:BSWV HLEV,{high_v}V")
@@ -159,7 +159,7 @@ def send_user_arb_over_lan(
         sdg.write(f"{ch}:BTWV STATE,ON")
         sdg.write(f"{ch}:BTWV MODE,TRIG")
         sdg.write(f"{ch}:BTWV NCYC,1")
-        sdg.write(f"{ch}:BTWV TRSR,MAN")
+        sdg.write(f"{ch}:BTWV TRSR,EXT")
 
         sdg.write(f"{ch}:OUTP ON")
 
