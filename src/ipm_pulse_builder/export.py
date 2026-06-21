@@ -26,3 +26,26 @@ def export_sdg_csv(program, path: str, npoints: int = 4096) -> float:
         for tu, a in zip(t_us, y_pm1):
             w.writerow([f"{tu*1e-6:.12g}", f"{a:.6g}"])
     return f_arb
+
+def export_signal(program, path: str, npoints: int = 4096, *, sdg=None, ui=None):
+    """
+    Export either:
+      - Siglent CSV (Time(s), Ampl(V)) if path ends with .csv
+      - IPM project file (JSON) otherwise (recommended: .ipmproj.json)
+
+    Returns:
+      - float ARB frequency for CSV exports
+      - None for project exports
+    """
+    p = Path(path)
+    suffixes = "".join(p.suffixes).lower()
+
+    # CSV export
+    if p.suffix.lower() == ".csv":
+        return export_sdg_csv(program, path, npoints=npoints)
+
+    # Project export
+    # (accept .ipmproj, .ipmproj.json, .json, etc.)
+    from signal_io import save_project
+    save_project(str(p), program, sdg=sdg or {}, ui=ui or {})
+    return None

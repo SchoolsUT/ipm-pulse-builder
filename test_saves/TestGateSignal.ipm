@@ -1,0 +1,37 @@
+{
+  "format": "ipm-pulse-builder",
+  "program": {
+    "items": [
+      {
+        "charge_width_us": 2.0,
+        "pwm_count": 10,
+        "pwm_period_us": 5.0,
+        "pwm_width_us": 0.5,
+        "type": "ChargePWM"
+      },
+      {
+        "gap_us": 100.0,
+        "type": "Gap"
+      },
+      {
+        "charge_width_us": 10.0,
+        "pwm_count": 10,
+        "pwm_period_us": 5.0,
+        "pwm_width_us": 0.5,
+        "type": "ChargePWM"
+      }
+    ],
+    "pre_gap_us": 500.0
+  },
+  "sdg": {
+    "channel": "C1",
+    "high_v": 5.0,
+    "host": "192.168.60.2",
+    "load": "50",
+    "low_v": 0.0,
+    "npoints": 4096,
+    "trigger_source": "EXT"
+  },
+  "ui": {},
+  "version": 1
+}

@@ -12,6 +12,8 @@ from matplotlib.figure import Figure
 
 from pulse_schedule import Program, ChargePWM, Gap
 from export import export_sdg_csv
+from export import export_signal
+from signal_io import load_project
 from send_over_lan import (
     setup_iota_over_lan,
     send_user_arb_over_lan,
@@ -258,7 +260,7 @@ class OptionsPane(ttk.LabelFrame):
                  on_iota_send, on_iota_to_ipm,
                  on_arm_changed=None, on_trigger=None,
                  on_cal_refresh=None, on_cal_load_changed=None, on_cal_voltage_changed=None,
-                 on_scope_grab=None):
+                 on_scope_grab=None, on_load_project=None):
         super().__init__(master, text="Options / Preview / Send (CH1 = IPM)")
         self.on_preview, self.on_export, self.on_send = on_preview, on_export, on_send
         self.on_iota_send, self.on_iota_to_ipm = on_iota_send, on_iota_to_ipm
@@ -268,6 +270,7 @@ class OptionsPane(ttk.LabelFrame):
         self.on_cal_load_changed = on_cal_load_changed
         self.on_cal_voltage_changed = on_cal_voltage_changed
         self.on_scope_grab = on_scope_grab
+        self.on_load_project = on_load_project
 
         self.spacing   = tk.StringVar(value="0.0")
         self.gas_us    = tk.StringVar(value="500.0")
@@ -294,13 +297,14 @@ class OptionsPane(ttk.LabelFrame):
         ttk.Entry(g, textvariable=self.spacing, width=10).grid(row=0, column=1, sticky="ew")
 
         ttk.Button(g, text="Preview", command=self._preview).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8,0))
-        ttk.Button(g, text="Export CSV (USB)", command=self._export).grid(row=2, column=0, columnspan=2, sticky="ew")
-        ttk.Button(g, text="Send to SDG (LAN)", command=self._send).grid(row=3, column=0, columnspan=2, sticky="ew")
+        ttk.Button(g, text="Export Signal", command=self._export).grid(row=2, column=0, columnspan=2, sticky="ew")
+        ttk.Button(g, text="Load IPM Project", command=self._load_project).grid(row=3, column=0, columnspan=2, sticky="ew")
+        ttk.Button(g, text="Send to SDG (LAN)", command=self._send).grid(row=4, column=0, columnspan=2, sticky="ew")
 
-        ttk.Button(g, text="Grab Scope CSVs", command=self._scope_grab).grid(row=4, column=0, columnspan=2, sticky="ew", pady=(6,0))
+        ttk.Button(g, text="Grab Scope CSVs", command=self._scope_grab).grid(row=5, column=0, columnspan=2, sticky="ew", pady=(6,0))
 
         # Arm/Trigger (optional)
-        row = 5
+        row = 6
         if self.on_arm_changed is not None:
             self._armed = tk.BooleanVar(value=False)
             ttk.Checkbutton(g, text="Arm (CH1 Output)", variable=self._armed, command=self._toggle_arm)\
@@ -351,8 +355,17 @@ class OptionsPane(ttk.LabelFrame):
         try: return float(self.spacing.get() or 0.0)
         except: return 0.0
 
+    def set_spacing(self, spacing_us: float) -> None:
+        try:
+            self.spacing.set(f3(max(0.0, float(spacing_us))))
+        except Exception:
+            self.spacing.set("0.000")
+
     def _preview(self): self.on_preview(self._spacing())
     def _export(self):  self.on_export(self._spacing())
+    def _load_project(self):
+        if self.on_load_project:
+            self.on_load_project()
     def _send(self):    self.on_send(self._spacing())
 
     def _toggle_arm(self):
@@ -447,6 +460,7 @@ class MainApp(tk.Tk):
             on_cal_load_changed=self._cal_load_changed,
             on_cal_voltage_changed=self._cal_voltage_changed,
             on_scope_grab=self.on_scope_grab,
+            on_load_project=self.on_load_project,
         )
         self.opts.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
 
@@ -534,19 +548,94 @@ class MainApp(tk.Tk):
     def on_export(self, spacing_us: float):
         if not self.seq.items:
             messagebox.showwarning("Export", "Sequence is empty."); return
-        path = filedialog.asksaveasfilename(title="Save Siglent CSV",
-                                            defaultextension=".csv",
-                                            filetypes=[("CSV","*.csv")],
-                                            initialfile="IPM_GATE.csv")
-        if not path: return
+        path = filedialog.asksaveasfilename(
+            title="Export",
+            filetypes=[
+                ("Siglent CSV", "*.csv"),
+                ("IPM Project", "*.ipm"),
+            ],
+            defaultextension=".csv",
+            initialfile="IPM_GATE.csv",
+        )
+        if not path:
+            return
+
         prog = self._build_program(spacing_us)
-        arb_f = export_sdg_csv(prog, path, npoints=4096)
-        messagebox.showinfo("Exported",
-            f"Saved: {os.path.basename(path)}\n"
-            f"Total duration: {prog.duration_us():.3f} µs\n"
-            f"Suggested ARB frequency: {arb_f:.2f} Hz\n\n"
-            "On the SDG:\n• Store/Recall → File Type: Data → select CSV on USB\n"
-            "• Set ARB Frequency to the value above\n• Set High=5 V, Low=0 V, Load 50 Ω")
+
+        sdg = {
+            "host": SDG_HOST,
+            "channel": "C1",
+            "npoints": 4096,
+            "high_v": 5.0,
+            "low_v": 0.0,
+            "load": "50",
+            "trigger_source": "EXT",
+        }
+
+        arb_f = export_signal(prog, path, npoints=4096, sdg=sdg, ui={})
+
+        if str(path).lower().endswith(".csv"):
+            messagebox.showinfo(
+                "Exported",
+                f"Saved: {os.path.basename(path)}\n"
+                f"Total duration: {prog.duration_us():.3f} µs\n"
+                f"Suggested ARB frequency: {arb_f:.2f} Hz\n"
+            )
+        else:
+            messagebox.showinfo(
+                "Saved Project",
+                f"Saved: {os.path.basename(path)}\n"
+                f"Blocks: {len(prog.items)}\n"
+                f"Total duration: {prog.duration_us():.3f} µs\n"
+            )
+
+
+    def on_load_project(self):
+        path = filedialog.askopenfilename(
+            title="Load IPM Project",
+            filetypes=[
+                ("IPM Project", "*.ipm *.IPM"),
+                ("All Files", "*.*"),
+            ],
+        )
+        if not path:
+            return
+
+        try:
+            prog, _sdg, _ui = load_project(path)
+        except Exception as e:
+            messagebox.showerror("Load IPM Project", f"Failed to load project:\n{e}")
+            return
+
+        try:
+            pre_gap = max(0.0, float(getattr(prog, "pre_gap_us", 0.0)))
+            self.editor.start_delay_us.set(f3(pre_gap))
+            self.seq.set_start_delay_us(pre_gap)
+            self.seq.clear()
+            for it in list(getattr(prog, "items", [])):
+                self.seq.add(it)
+
+            # Saved spacing is already represented as loaded GAP blocks.
+            # Resetting this prevents accidentally double-adding spacing after load.
+            self.opts.set_spacing(0.0)
+
+            for it in self.seq.items:
+                if isinstance(it, ChargePWM):
+                    self.editor.set_fields_from_pulse(it)
+                    break
+
+            self.on_preview(0.0)
+        except Exception as e:
+            messagebox.showerror("Load IPM Project", f"Project loaded, but GUI restore failed:\n{e}")
+            return
+
+        messagebox.showinfo(
+            "Loaded IPM Project",
+            f"Loaded: {os.path.basename(path)}\n"
+            f"Blocks: {len(getattr(prog, 'items', []))}\n"
+            f"Start delay: {getattr(prog, 'pre_gap_us', 0.0):.3f} µs\n"
+            f"Total duration: {prog.duration_us():.3f} µs"
+        )
 
     def on_send(self, spacing_us: float):
         if not self._ack_no_model and not self.model_ok:

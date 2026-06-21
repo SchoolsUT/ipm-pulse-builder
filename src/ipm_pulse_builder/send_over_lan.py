@@ -33,7 +33,7 @@ def _query_levels(sdg, ch: str) -> tuple[str, float | None, float | None]:
 
 # SDG effective ARB sample rate (empirical for SDG1062X)
 SDG_ARB_FS = 30_000_000
-_ALLOWED_ARBLENS = (64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384)
+_ALLOWED_ARBLENS = (8192, 16384)
 
 def _pick_npoints_from_waveform(t_us, y, target_samples_on_min_high: int = 8, requested_n: int | None = None) -> int:
     if not t_us or not y or len(t_us) != len(y):
