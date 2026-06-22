@@ -143,7 +143,7 @@ class SequenceList(ttk.LabelFrame):
         self.start_delay_us: float = 0.0  # display-only, Program.pre_gap_us lives in MainApp
 
         frm = ttk.Frame(self); frm.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
-        self.lb = tk.Listbox(frm, width=44, height=16)
+        self.lb = tk.Listbox(frm, width=44, height=16, selectmode=tk.EXTENDED)
         self.lb.grid(row=0, column=0, rowspan=6, sticky="nsew")
         sb = ttk.Scrollbar(frm, orient="vertical", command=self.lb.yview)
         self.lb.config(yscrollcommand=sb.set); sb.grid(row=0, column=1, rowspan=6, sticky="ns")
@@ -151,6 +151,7 @@ class SequenceList(ttk.LabelFrame):
         ttk.Button(frm, text="↓", command=self.down).grid(row=1, column=2, sticky="ew")
         ttk.Button(frm, text="Remove", command=self.remove).grid(row=2, column=2, sticky="ew")
         ttk.Button(frm, text="Clear", command=self.clear).grid(row=3, column=2, sticky="ew")
+        ttk.Button(frm, text="Duplicate", command=self.duplicate).grid(row=4, column=2, sticky="ew")
 
         frm.rowconfigure(5, weight=1); frm.columnconfigure(0, weight=1)
         self.lb.bind("<<ListboxSelect>>", self._sel)
@@ -187,6 +188,62 @@ class SequenceList(ttk.LabelFrame):
             return f"GAP {f3(it.gap_us)} µs"
         return f"Pulse  Charge {f3(it.charge_width_us)} µs | PWM {f3(it.pwm_width_us)}/{f3(it.pwm_period_us)} µs ×{it.pwm_count}"
 
+    def _copy_item(self, it: ChargePWM | Gap) -> ChargePWM | Gap:
+        """Create a new block object with the same parameters."""
+        if isinstance(it, Gap):
+            return Gap(gap_us=it.gap_us)
+        return ChargePWM(
+            charge_width_us=it.charge_width_us,
+            pwm_width_us=it.pwm_width_us,
+            pwm_period_us=it.pwm_period_us,
+            pwm_count=it.pwm_count,
+        )
+
+    def _selected_item_indices(self) -> list[int]:
+        """
+        Return selected indices into self.items.
+        Listbox index 0 is Start Delay, so editable items are listbox_index - 1.
+        """
+        out: list[int] = []
+        for lb_idx in self.lb.curselection():
+            if lb_idx == 0:
+                continue
+            item_idx = lb_idx - 1
+            if 0 <= item_idx < len(self.items):
+                out.append(item_idx)
+        return sorted(set(out))
+
+    def _is_contiguous(self, idxs: list[int]) -> bool:
+        return bool(idxs) and idxs == list(range(idxs[0], idxs[-1] + 1))
+
+    def _redraw_listbox(self) -> None:
+        """Redraw listbox from self.items while preserving the fixed Start Delay row."""
+        self.lb.delete(0, tk.END)
+        self.lb.insert(0, f"Start Delay {f3(self.start_delay_us)} µs")
+        try:
+            self.lb.itemconfig(0, fg="gray")
+        except tk.TclError:
+            pass
+
+        for it in self.items:
+            self.lb.insert(tk.END, self._label(it))
+
+    def _select_item_range(self, first_item_idx: int, last_item_idx: int) -> None:
+        """Select a range of self.items indices in the listbox."""
+        self.lb.selection_clear(0, tk.END)
+
+        if not self.items:
+            return
+
+        first_item_idx = max(0, min(first_item_idx, len(self.items) - 1))
+        last_item_idx = max(0, min(last_item_idx, len(self.items) - 1))
+
+        for item_idx in range(first_item_idx, last_item_idx + 1):
+            self.lb.selection_set(item_idx + 1)  # +1 because Start Delay row
+
+        self.lb.activate(first_item_idx + 1)
+        self.lb.see(first_item_idx + 1)
+
     def add(self, it: ChargePWM | Gap) -> None:
         self.items.append(it)
         self.lb.insert(tk.END, self._label(it))  # goes after Start Delay row
@@ -222,24 +279,73 @@ class SequenceList(ttk.LabelFrame):
         self.items.clear()
 
     def up(self):
-        sel = self.lb.curselection()
-        if not sel: return
-        idx = sel[0]
-        # idx 0 is Start Delay; idx 1 is first movable item and can't move up
-        if idx <= 1: return
-        i = idx - 1
-        self.items[i-1], self.items[i] = self.items[i], self.items[i-1]
-        txt = self.lb.get(idx); self.lb.delete(idx); self.lb.insert(idx-1, txt); self.lb.select_set(idx-1)
+        idxs = self._selected_item_indices()
+        if not idxs:
+            return
+
+        if not self._is_contiguous(idxs):
+            messagebox.showwarning("Move", "Select one contiguous group of blocks.")
+            return
+
+        first = idxs[0]
+        last = idxs[-1]
+
+        if first == 0:
+            return
+
+        group = self.items[first:last+1]
+        above = self.items[first-1]
+
+        self.items[first-1:last+1] = group + [above]
+
+        self._redraw_listbox()
+        self._select_item_range(first-1, last-1)
 
     def down(self):
-        sel = self.lb.curselection()
-        if not sel: return
-        idx = sel[0]
-        # can't move Start Delay; last movable item is at idx == len(items)
-        if idx == 0 or idx >= len(self.items): return
-        i = idx - 1
-        self.items[i+1], self.items[i] = self.items[i], self.items[i+1]
-        txt = self.lb.get(idx); self.lb.delete(idx); self.lb.insert(idx+1, txt); self.lb.select_set(idx+1)
+        idxs = self._selected_item_indices()
+        if not idxs:
+            return
+
+        if not self._is_contiguous(idxs):
+            messagebox.showwarning("Move", "Select one contiguous group of blocks.")
+            return
+
+        first = idxs[0]
+        last = idxs[-1]
+
+        if last >= len(self.items) - 1:
+            return
+
+        group = self.items[first:last+1]
+        below = self.items[last+1]
+
+        self.items[first:last+2] = [below] + group
+
+        self._redraw_listbox()
+        self._select_item_range(first+1, last+1)
+
+    def duplicate(self):
+        idxs = self._selected_item_indices()
+        if not idxs:
+            return
+
+        if not self._is_contiguous(idxs):
+            messagebox.showwarning("Duplicate", "Select one contiguous group of blocks.")
+            return
+
+        first = idxs[0]
+        last = idxs[-1]
+
+        copies = [self._copy_item(self.items[i]) for i in idxs]
+
+        insert_at = last + 1
+        self.items[insert_at:insert_at] = copies
+
+        self._redraw_listbox()
+
+        new_first = insert_at
+        new_last = insert_at + len(copies) - 1
+        self._select_item_range(new_first, new_last)
 
     def _sel(self, _):
         sel = self.lb.curselection()
